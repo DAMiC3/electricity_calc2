@@ -115,7 +115,7 @@ def main():
         #       docs/ (output)
         #     electricity_calc_extra/ (sibling folder with Excel)
         src = r"..\..\..\electricity_calc_extra\Tarif_prices.xlsx"
-        out = r"C:\fluttertwee\flutter\docs\tariffs.json"
+        out = r"C:\fluttertwee\flutter\electricity_calc2\docs\tariffs.json"
     elif len(sys.argv) == 3:
         src, out = sys.argv[1], sys.argv[2]
     else:
