@@ -1,5 +1,6 @@
 {
-  "versionYear": 2025,
+  "versionYear": 2026,
+  "exportedOn": "2026-11-18",
   "regions": [
     {
       "regionKey": "ekurhuleni",
@@ -81,7 +82,7 @@
         {
           "from": 701,
           "to": null,
-          "rate": 1.13522
+          "rate": 11.3522
         }
       ]
     },
@@ -109,7 +110,7 @@
         {
           "from": 701,
           "to": null,
-          "rate": 1.27985
+          "rate": 12.7985
         }
       ]
     },
@@ -122,22 +123,35 @@
         {
           "from": 1,
           "to": 50,
-          "rate": 3.253
+          "rate": 2.9745
         },
         {
           "from": 51,
           "to": 600,
-          "rate": 3.253
+          "rate": 2.9745
         },
         {
           "from": 601,
           "to": 700,
-          "rate": 5.0809
+          "rate": 4.6392
         },
         {
           "from": 701,
           "to": null,
-          "rate": 13.1558
+          "rate": 11.993
+        }
+      ]
+    },
+    {
+      "regionKey": "ekurhuleni",
+      "displayName": "Ekurhuleni",
+      "startDate": "2026-07-01",
+      "endDate": "2027-06-30",
+      "blocks": [
+        {
+          "from": 1,
+          "to": null,
+          "rate": 3.523
         }
       ]
     },
@@ -163,7 +177,7 @@
         {
           "from": 1,
           "to": null,
-          "rate": 2.9447
+          "rate": 2.8872
         }
       ]
     },
@@ -202,7 +216,20 @@
         {
           "from": 1,
           "to": null,
-          "rate": 4.2142
+          "rate": 3.878
+        }
+      ]
+    },
+    {
+      "regionKey": "ekurhuleni_flat",
+      "displayName": "Ekurhuleni_flat",
+      "startDate": "2026-07-01",
+      "endDate": "2027-06-30",
+      "blocks": [
+        {
+          "from": 1,
+          "to": null,
+          "rate": 3.8755
         }
       ]
     },
@@ -215,17 +242,17 @@
         {
           "from": 1,
           "to": 350,
-          "rate": 2.2441
+          "rate": 1.9514
         },
         {
           "from": 351,
           "to": 500,
-          "rate": 2.5743
+          "rate": 2.2385
         },
         {
           "from": 501,
           "to": null,
-          "rate": 2.9333
+          "rate": 2.6197
         }
       ]
     },
@@ -238,17 +265,17 @@
         {
           "from": 1,
           "to": 350,
-          "rate": 2.4119
+          "rate": 2.0973
         },
         {
           "from": 351,
           "to": 500,
-          "rate": 2.7666
+          "rate": 2.4057
         },
         {
           "from": 501,
           "to": null,
-          "rate": 3.1523
+          "rate": 2.8101
         }
       ]
     },
@@ -271,7 +298,7 @@
         {
           "from": 501,
           "to": null,
-          "rate": 3.1516
+          "rate": 3.2206
         }
       ]
     },
@@ -294,7 +321,7 @@
         {
           "from": 501,
           "to": null,
-          "rate": 3.5525
+          "rate": 3.6215
         }
       ]
     },
@@ -317,7 +344,30 @@
         {
           "from": 501,
           "to": null,
-          "rate": 4.005
+          "rate": 4.074
+        }
+      ]
+    },
+    {
+      "regionKey": "joburg",
+      "displayName": "City of Johannesburg",
+      "startDate": "2026-07-01",
+      "endDate": "2027-06-30",
+      "blocks": [
+        {
+          "from": 1,
+          "to": 350,
+          "rate": 3.3403
+        },
+        {
+          "from": 351,
+          "to": 500,
+          "rate": 3.8316
+        },
+        {
+          "from": 501,
+          "to": null,
+          "rate": 4.4349
         }
       ]
     },
@@ -458,6 +508,34 @@
           "from": 651,
           "to": null,
           "rate": 4.709
+        }
+      ]
+    },
+    {
+      "regionKey": "tshwane",
+      "displayName": "City of Tshwane",
+      "startDate": "2026-07-01",
+      "endDate": "2027-06-30",
+      "blocks": [
+        {
+          "from": 1,
+          "to": 100,
+          "rate": 3.7274
+        },
+        {
+          "from": 101,
+          "to": 400,
+          "rate": 4.3622
+        },
+        {
+          "from": 401,
+          "to": 650,
+          "rate": 4.7525
+        },
+        {
+          "from": 651,
+          "to": null,
+          "rate": 5.1234
         }
       ]
     }

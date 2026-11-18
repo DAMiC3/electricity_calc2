@@ -1,51 +1,35 @@
-just put this file path,run the converter and run these three things
-cd C:\fluttertwee\flutter
-# run your converter here (e.g. .\electricity_calc\tools\tarifs\convert.ps1)
-git add electricity_calc/docs\tariffs.json
-git commit -m "Refresh tariff JSON"
-git push origin main
+How tariffs work now (from v1.1.1)
 
+The tariffs live in the Supabase database (project "Prepaid Watchdog All
+Accounts Data"), not in Excel. The app downloads them every time it starts.
 
+Tables (Supabase dashboard > Table Editor):
+- tariff_blocks         one row per block: region, financial year, kWh range,
+                        rate EXCLUDING VAT as printed in the municipal tariff
+                        book (rate_incl_vat is calculated automatically),
+                        plus any per-kWh surcharge on that block.
+- tariff_fixed_charges  monthly fixed charges that prepaid customers pay out of
+                        their token purchases (e.g. City Power Prepaid High).
 
-How to publish tariffs from Excel (Option A: Hosted JSON)
+Yearly update (each July, when the municipalities publish new tariffs):
+1. In tariff_blocks, add one row per block for the new year:
+   start_date = 1 July, end_date = 30 June next year, same region_key and
+   display_name as last year, rate_excl_vat exactly as printed (R/kWh, so
+   324,12 c/kWh -> 3.2412). Put the document link in source_url.
+   Joburg: put 0.06 in surcharge_excl_vat on the "above 500 kWh" block
+   (6c/kWh network surcharge) if the schedule still says so.
+2. If a fixed charge applies, add a row in tariff_fixed_charges with the same
+   region_key and start_date (amount_excl_vat per month, as printed).
+3. In the SQL editor run:   select * from public.tariff_check;
+   No rows = all good. Any row describes a gap, overlap or likely typo.
+4. Done - phones pick it up the next time the app opens.
 
-This guide assumes your Excel lives at:
-  electricity_calc_extra/Tarif_prices.xlsx
+Until a new year is added, the app keeps using the most recent year's rates.
 
-What you will do once per year:
-1) Edit the Excel with the new year’s rates.
-2) Run the converter to generate docs/tariffs.json.
-3) Commit/push docs/tariffs.json to GitHub.
-4) Enable GitHub Pages (serving the /docs folder).
-5) In the app, tap “Check tariff updates now” (or wait for the monthly check).
+Old app versions (1.1.0 and earlier) still read the GitHub Pages JSON. To
+refresh it from the database:
+   py tools/tariffs/export_json.py docs/tariffs.json
+then commit and push docs/tariffs.json (and copy it to the old
+electricity_calc repo's docs folder, which the very first release reads).
 
-Excel format (one row per tier)
-- Columns: regionKey, displayName, startDate, endDate, tierFrom, tierTo, rate
-- Dates: use yyyy-mm-dd (startDate is 1 July; endDate is 30 June of next year or blank for ongoing)
-- Last tier per year: leave tierTo blank (open-ended)
-
-Install prerequisites (Windows)
-1) Install Python from https://www.python.org/downloads/ (tick “Add Python to PATH”)
-2) Open PowerShell in repo root and run:
-   py -m pip install --upgrade pip
-   py -m pip install pandas openpyxl
-
-Generate tariffs.json (two ways)
-- Quick way (uses default paths):
-  tools/tariffs/convert.bat
-
-- Manual way (custom paths):
-  py tools/tariffs/convert.py electricity_calc_extra/Tarif_prices.xlsx docs/tariffs.json
-
-Publish via GitHub Pages
-1) Commit docs/tariffs.json and push to GitHub.
-2) In your GitHub repo: Settings → Pages → Set “Deploy from a branch”, folder = /docs.
-3) Copy the URL that GitHub shows. Your file will be at:
-   https://damic3.github.io/electricity_calc/tariffs.json
-
-Point the app to the URL
-- In lib/main.dart, set TariffManager.tariffsUrl to the URL above.
-- In the app Settings, tap “Check tariff updates now”.
-
-That’s it. Next year, repeat: update Excel → run converter → commit docs/tariffs.json.
-
+convert.py / convert.bat (Excel -> JSON) are no longer used.

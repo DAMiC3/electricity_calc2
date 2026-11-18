@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
-import 'package:http/http.dart' as http;
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -89,7 +89,8 @@ class _BootstrapperState extends State<Bootstrapper> {
   Future<void> _init() async {
     final prefs = await SharedPreferences.getInstance();
     await TariffManager.ensureTariffs();   // validate cached tariffs
-    await TariffManager.tryAutoUpdate();   // monthly check for remote updates
+    await TariffManager.refreshOnStartup(); // fetch latest tariffs from the database
+    await SecretStore.migrateLegacy();      // move old plain-text passwords to secure storage
 
     if (kStartAtLogin) {
       // Clear only the active session (keeps registered users)
@@ -124,8 +125,8 @@ class TariffBlock {
   Map<String, dynamic> toJson() => {'from': from, 'to': to, 'rate': rate};
 
   factory TariffBlock.fromJson(Map<String, dynamic> j) => TariffBlock(
-        from: j['from'],
-        to: j['to'],
+        from: (j['from'] as num).toInt(),
+        to: (j['to'] as num?)?.toInt(),
         rate: (j['rate'] as num).toDouble(),
       );
 }
@@ -154,6 +155,12 @@ class RegionTariff {
   final List<TariffBlock> blocks;
   final DateTime startDate;     // effective from (inclusive)
   final DateTime? endDate;      // effective until (inclusive); null = ongoing
+  final String customerType;    // 'residential' | 'commercial'
+  /// Monthly fixed charge (R, VAT incl.) taken from token purchases, 0 = none.
+  final double fixedMonthly;
+  /// Purchases below this amount (R, VAT incl.) pay half towards the fixed
+  /// charge and half towards electricity. Null = the fixed charge comes first.
+  final double? fixedSplitBelow;
 
   RegionTariff({
     required this.regionKey,
@@ -161,11 +168,28 @@ class RegionTariff {
     required this.blocks,
     required this.startDate,
     this.endDate,
+    this.customerType = 'residential',
+    this.fixedMonthly = 0,
+    this.fixedSplitBelow,
   });
+
+  /// True when [date] falls inside this tariff's period. The end date is
+  /// inclusive for the whole day (a purchase at 14:00 on 30 June counts).
+  bool covers(DateTime date) {
+    final day = DateTime(date.year, date.month, date.day);
+    final start = DateTime(startDate.year, startDate.month, startDate.day);
+    if (day.isBefore(start)) return false;
+    if (endDate == null) return true;
+    final end = DateTime(endDate!.year, endDate!.month, endDate!.day);
+    return !day.isAfter(end);
+  }
 
   Map<String, dynamic> toJson() => {
         'regionKey': regionKey,
         'displayName': displayName,
+        'customerType': customerType,
+        'fixedMonthly': fixedMonthly,
+        'fixedSplitBelow': fixedSplitBelow,
         'blocks': blocks.map((b) => b.toJson()).toList(),
         'startDate': startDate.toIso8601String(),
         'endDate': endDate?.toIso8601String(),
@@ -184,12 +208,16 @@ class RegionTariff {
       final e = j['endDate'];
       if (e is String && e.isNotEmpty) parsedEnd = DateTime.parse(e);
     } catch (_) {}
+    final type = j['customerType'];
     return RegionTariff(
       regionKey: j['regionKey'],
       displayName: j['displayName'],
       blocks: (j['blocks'] as List).map((e) => TariffBlock.fromJson(e)).toList(),
       startDate: parsedStart ?? defaultStart,
       endDate: parsedEnd,
+      customerType: type is String && type.isNotEmpty ? type : 'residential',
+      fixedMonthly: (j['fixedMonthly'] as num?)?.toDouble() ?? 0,
+      fixedSplitBelow: (j['fixedSplitBelow'] as num?)?.toDouble(),
     );
   }
 }
@@ -248,11 +276,23 @@ class TransactionRecord {
         expectedKwh: (j['expectedKwh'] as num).toDouble(),
       );
 
+  /// purchased_at is saved as the phone's local wall-clock time without a
+  /// timezone, so the database reports it back labelled as UTC. Rebuild the
+  /// same wall-clock time as a local DateTime so it compares correctly with
+  /// dates picked in the app (otherwise purchases close together on the same
+  /// day could be ordered 2 hours wrong).
+  static DateTime wallClockFrom(String raw) {
+    final d = DateTime.parse(raw);
+    if (!d.isUtc) return d;
+    return DateTime(d.year, d.month, d.day, d.hour, d.minute, d.second,
+        d.millisecond, d.microsecond);
+  }
+
   factory TransactionRecord.fromSupabase(Map<String, dynamic> row) =>
       TransactionRecord(
         id: (row['id'] ?? '').toString(),
         regionKey: (row['region_key'] as String?) ?? '',
-        date: DateTime.parse(row['purchased_at'] as String),
+        date: wallClockFrom(row['purchased_at'] as String),
         money: (row['amount'] as num).toDouble(),
         actualKwh: (row['energy_kwh'] as num?)?.toDouble() ?? 0,
         expectedKwh: (row['expected_kwh'] as num?)?.toDouble() ?? 0,
@@ -520,9 +560,11 @@ class QueryStore {
       if (userId == null || userId.isEmpty) continue;
       grouped.putIfAbsent(userId, () => []).add(_messageFromRow(map));
     }
+    // Look up all usernames once instead of once per conversation.
+    final emailsById = await Auth.emailsByUserId();
     final threads = <QueryThread>[];
     for (final entry in grouped.entries) {
-      final email = await Auth.emailForUserId(entry.key) ?? entry.key;
+      final email = emailsById[entry.key] ?? entry.key;
       threads.add(QueryThread(userEmail: email, messages: entry.value));
     }
     threads.sort((a, b) {
@@ -538,14 +580,13 @@ class QueryStore {
 /// TARIFF MANAGER: cached remote tariffs + monthly fetch
 /// =======================================================
 class TariffManager {
-  // TODO: Replace with your hosted JSON (GitHub raw / Firebase / S3)
-  static const String tariffsUrl =
-      'https://damic3.github.io/electricity_calc/tariffs.json';
+  static const String _cacheKey = 'tariffs_json';
+  static const Duration _fetchTimeout = Duration(seconds: 8);
 
   /// Validate cached tariffs and clear them if they look malformed.
   static Future<void> ensureTariffs() async {
     final prefs = await SharedPreferences.getInstance();
-    final cached = prefs.getString('tariffs_json');
+    final cached = prefs.getString(_cacheKey);
     if (cached == null) return;
     try {
       final data = jsonDecode(cached);
@@ -562,48 +603,33 @@ class TariffManager {
     }
   }
 
-  // Latest effective tariff per region (deduplicated by regionKey)
-  static Future<List<RegionTariff>> loadTariffs() async {
+  /// Called once at app start. Tariffs come from the database on every start
+  /// so corrections and new financial years reach users straight away.
+  /// When tariffs are already cached the refresh runs in the background, so
+  /// opening the app never waits on the network; on a first start (nothing
+  /// cached yet) it waits for the download, up to 8 seconds.
+  static Future<void> refreshOnStartup() async {
     final prefs = await SharedPreferences.getInstance();
-    final s = prefs.getString('tariffs_json');
-    if (s == null) return [];
-    try {
-      final data = jsonDecode(s);
-      if (data is Map<String, dynamic> && data['regions'] is List) {
-        final parsed = (data['regions'] as List)
-            .map((e) => RegionTariff.fromJson(e))
-            .toList();
-        final Map<String, RegionTariff> latest = {};
-        for (final r in parsed) {
-          final prev = latest[r.regionKey];
-          if (prev == null || r.startDate.isAfter(prev.startDate)) {
-            latest[r.regionKey] = r;
-          }
-        }
-        return latest.values.toList();
-      }
-    } catch (_) {
-      // ignore malformed cached tariffs
+    final cached = prefs.getString(_cacheKey);
+    // Wait for the download when nothing is cached, or when the cache is the
+    // old GitHub file from a previous app version (first start after the
+    // update), so a session never mixes old and new tariffs.
+    if (cached == null || !cached.contains('"source":"database"')) {
+      await tryAutoUpdate(force: true);
+    } else {
+      unawaited(tryAutoUpdate(force: true));
     }
-    return [];
   }
 
-  // For now both residential and commercial return the same list until
-  // distinct commercial blocks are supplied remotely.
-  static Future<List<RegionTariff>> loadTariffsForType(String customerType) async {
-    return loadTariffs();
-  }
-
-  // Full list with history (multiple entries per regionKey).
-  static Future<List<RegionTariff>> loadTariffsAll() async {
+  static Future<List<RegionTariff>> _loadCached() async {
     final prefs = await SharedPreferences.getInstance();
-    final s = prefs.getString('tariffs_json');
+    final s = prefs.getString(_cacheKey);
     if (s == null) return [];
     try {
       final data = jsonDecode(s);
       if (data is Map<String, dynamic> && data['regions'] is List) {
         return (data['regions'] as List)
-            .map((e) => RegionTariff.fromJson(e))
+            .map((e) => RegionTariff.fromJson(Map<String, dynamic>.from(e as Map)))
             .toList();
       }
     } catch (_) {
@@ -612,57 +638,157 @@ class TariffManager {
     return [];
   }
 
+  /// Tariff entries for one customer type. A region that has no tariffs of
+  /// its own for that type falls back to its residential tariffs.
+  static List<RegionTariff> selectForType(
+      List<RegionTariff> all, String customerType) {
+    final type = customerType == 'commercial' ? 'commercial' : 'residential';
+    final regionsWithType = all
+        .where((r) => r.customerType == type)
+        .map((r) => r.regionKey)
+        .toSet();
+    return all.where((r) {
+      if (regionsWithType.contains(r.regionKey)) return r.customerType == type;
+      return r.customerType == 'residential';
+    }).toList();
+  }
+
+  /// One entry per region: the tariff in force on [on] (default today).
+  /// Keeps the regions in the order they were first listed.
+  static List<RegionTariff> currentPerRegion(List<RegionTariff> list,
+      [DateTime? on]) {
+    final day = on ?? DateTime.now();
+    final keys = <String>[];
+    for (final r in list) {
+      if (!keys.contains(r.regionKey)) keys.add(r.regionKey);
+    }
+    return [for (final k in keys) findRegionForDate(list, k, day)!];
+  }
+
+  // Current tariff per region (residential), e.g. for the sign-in region list.
+  static Future<List<RegionTariff>> loadTariffs() async {
+    return currentPerRegion(selectForType(await _loadCached(), 'residential'));
+  }
+
+  // Current tariff per region for a customer type.
+  static Future<List<RegionTariff>> loadTariffsForType(String customerType) async {
+    return currentPerRegion(selectForType(await _loadCached(), customerType));
+  }
+
+  // Full list with history (multiple entries per regionKey) for a customer type.
+  static Future<List<RegionTariff>> loadTariffsAll(
+      {String customerType = 'residential'}) async {
+    return selectForType(await _loadCached(), customerType);
+  }
+
   /// Clear any cached tariff data. Use once remote data is updated.
   static Future<void> clearTariffs() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('tariffs_json');
+    await prefs.remove(_cacheKey);
     await prefs.remove('tariffs_updated_year');
     await prefs.remove('tariffs_updated_at');
     await prefs.remove('tariffs_checked_month');
   }
 
-  /// Auto update (once per calendar month, or if no cached tariffs exist).
-  static Future<void> tryAutoUpdate({bool force = false}) async {
-    final prefs = await SharedPreferences.getInstance();
-    final cached = prefs.getString('tariffs_json');
-    final bool hasCachedTariffs = cached != null;
+  static int _toInt(dynamic v) =>
+      v is num ? v.toInt() : int.parse(v.toString());
 
-    final now = DateTime.now();
-    final nowMonth = DateFormat('yyyy-MM').format(now);
-    final lastCheckedMonth = prefs.getString('tariffs_checked_month');
+  static double _toDouble(dynamic v) =>
+      v is num ? v.toDouble() : double.parse(v.toString());
 
-    if (!force && hasCachedTariffs && lastCheckedMonth == nowMonth) {
-      return;
+  /// Turns tariff_blocks rows (one row per block) into tariff periods, and
+  /// attaches the matching tariff_fixed_charges row (same region, customer
+  /// type and start date), if any.
+  static List<RegionTariff> regionsFromRows(List<Map<String, dynamic>> rows,
+      {List<Map<String, dynamic>> fixedRows = const []}) {
+    String keyOf(Map<String, dynamic> row) {
+      final type = (row['customer_type'] as String?) ?? 'residential';
+      return '${row['region_key']}|$type|${row['start_date']}';
     }
 
-    bool updated = false;
+    final fixedByKey = {for (final f in fixedRows) keyOf(f): f};
+    final Map<String, List<Map<String, dynamic>>> grouped = {};
+    for (final row in rows) {
+      grouped.putIfAbsent(keyOf(row), () => []).add(row);
+    }
+    final out = <RegionTariff>[];
+    for (final entry in grouped.entries) {
+      final group = entry.value;
+      final first = group.first;
+      final fixed = fixedByKey[entry.key];
+      final blocks = group
+          .map((r) => TariffBlock(
+                from: _toInt(r['tier_from']),
+                to: r['tier_to'] == null ? null : _toInt(r['tier_to']),
+                rate: _toDouble(r['rate_incl_vat']),
+              ))
+          .toList()
+        ..sort((a, b) => a.from.compareTo(b.from));
+      final end = first['end_date'];
+      out.add(RegionTariff(
+        regionKey: first['region_key'] as String,
+        displayName: first['display_name'] as String,
+        customerType: (first['customer_type'] as String?) ?? 'residential',
+        blocks: blocks,
+        startDate: DateTime.parse(first['start_date'] as String),
+        endDate: end == null ? null : DateTime.parse(end as String),
+        fixedMonthly:
+            fixed == null ? 0 : _toDouble(fixed['amount_incl_vat']),
+        fixedSplitBelow: fixed == null || fixed['split_below_incl_vat'] == null
+            ? null
+            : _toDouble(fixed['split_below_incl_vat']),
+      ));
+    }
+    return out;
+  }
+
+  /// Downloads the tariffs from the database and caches them on the device.
+  /// Returns true when fresh tariffs were saved. On any failure (offline,
+  /// timeout) the cached tariffs are kept.
+  static Future<bool> tryAutoUpdate({bool force = false}) async {
     try {
-      final res = await http
-          .get(Uri.parse(tariffsUrl))
-          .timeout(const Duration(seconds: 8));
-      if (res.statusCode == 200) {
-        final dynamic data = jsonDecode(res.body);
-        if (data is Map && data['regions'] is List) {
-          await prefs.setString('tariffs_json', res.body);
-          final versionYear = data['versionYear'];
-          if (versionYear is int) {
-            await prefs.setInt('tariffs_updated_year', versionYear);
-          } else {
-            await prefs.remove('tariffs_updated_year');
-          }
-          await prefs.setString(
-              'tariffs_updated_at', DateTime.now().toIso8601String());
-          updated = true;
-        }
-      }
-    } catch (_) {
-      // swallow -> keep cached data or try again later
-    }
+      final rows = await Supabase.instance.client
+          .from('tariff_blocks')
+          .select(
+              'region_key, display_name, customer_type, start_date, end_date, tier_from, tier_to, rate_incl_vat')
+          .order('region_key', ascending: true)
+          .order('customer_type', ascending: true)
+          .order('start_date', ascending: true)
+          .order('tier_from', ascending: true)
+          .timeout(_fetchTimeout);
+      final fixedRows = await Supabase.instance.client
+          .from('tariff_fixed_charges')
+          .select(
+              'region_key, customer_type, start_date, amount_incl_vat, split_below_incl_vat')
+          .timeout(_fetchTimeout);
+      final regions = regionsFromRows(
+          rows.map((r) => Map<String, dynamic>.from(r)).toList(),
+          fixedRows: fixedRows.map((r) => Map<String, dynamic>.from(r)).toList());
+      if (regions.isEmpty) return false;
 
-    if (updated || hasCachedTariffs) {
-      await prefs.setString('tariffs_checked_month', nowMonth);
-    } else {
-      await prefs.remove('tariffs_checked_month');
+      final versionYear = regions
+          .map((r) => r.startDate.year)
+          .reduce((a, b) => a > b ? a : b);
+      final prefs = await SharedPreferences.getInstance();
+      final encoded = jsonEncode({
+        'versionYear': versionYear,
+        'source': 'database',
+        'regions': regions.map((r) => r.toJson()).toList(),
+      });
+      // "Tariffs last updated" (Settings) only moves when the tariffs changed.
+      final changed = prefs.getString(_cacheKey) != encoded;
+      await prefs.setString(_cacheKey, encoded);
+      await prefs.setInt('tariffs_updated_year', versionYear);
+      if (changed || prefs.getString('tariffs_updated_at') == null) {
+        await prefs.setString(
+            'tariffs_updated_at', DateTime.now().toIso8601String());
+      }
+      await prefs.setString(
+          'tariffs_checked_month', DateFormat('yyyy-MM').format(DateTime.now()));
+      return true;
+    } catch (err) {
+      if (kDebugMode) debugPrint('Tariff download failed: $err');
+      return false;
     }
   }
 
@@ -674,19 +800,109 @@ class TariffManager {
     }
   }
 
-  /// Find the tariff entry for a region that is effective on a given date.
-  /// If multiple entries match, choose the one with the latest startDate.
+  /// The tariff for a region that is in force on [date].
+  /// If no period covers the date (e.g. next year's rates are not loaded yet)
+  /// the most recent tariff that had already started is used - never an
+  /// older year. Returns null only when the region has no tariffs at all.
   static RegionTariff? findRegionForDate(
       List<RegionTariff> regions, String key, DateTime date) {
-    final candidates = regions.where((r) => r.regionKey == key).where((r) {
-      final startsOk = !date.isBefore(r.startDate);
-      final endsOk = r.endDate == null || !date.isAfter(r.endDate!);
-      return startsOk && endsOk;
-    }).toList();
-    if (candidates.isEmpty) return findRegion(regions, key);
-    candidates.sort((a, b) => b.startDate.compareTo(a.startDate));
-    return candidates.first;
+    final forKey = regions.where((r) => r.regionKey == key).toList();
+    if (forKey.isEmpty) return null;
+
+    final covering = forKey.where((r) => r.covers(date)).toList()
+      ..sort((a, b) => b.startDate.compareTo(a.startDate));
+    if (covering.isNotEmpty) return covering.first;
+
+    final day = DateTime(date.year, date.month, date.day);
+    final started = forKey.where((r) => !r.startDate.isAfter(day)).toList()
+      ..sort((a, b) => b.startDate.compareTo(a.startDate));
+    if (started.isNotEmpty) return started.first;
+
+    // Date is before every known tariff: use the earliest one.
+    forKey.sort((a, b) => a.startDate.compareTo(b.startDate));
+    return forKey.first;
   }
+}
+
+/// =======================================================
+/// SECRET STORE (passwords kept on this device)
+/// =======================================================
+/// Passwords saved on the phone (for "Sign in with previous details" and
+/// "View my username & password") are kept in the platform's encrypted
+/// storage (Android Keystore) instead of plain SharedPreferences.
+/// Values saved by older app versions are moved across on first read.
+class SecretStore {
+  static const FlutterSecureStorage _storage = FlutterSecureStorage(
+    aOptions: AndroidOptions(
+      encryptedSharedPreferences: true,
+      resetOnError: true,
+    ),
+  );
+
+  static Future<String?> read(String key) async {
+    try {
+      final value = await _storage.read(key: key);
+      if (value != null) return value;
+    } catch (err) {
+      if (kDebugMode) debugPrint('Secure read failed for $key: $err');
+    }
+    // Value saved by an older app version (or a device without secure storage).
+    final prefs = await SharedPreferences.getInstance();
+    final legacy = prefs.getString(key);
+    if (legacy != null && legacy.isNotEmpty) {
+      if (await _trySecureWrite(key, legacy)) await prefs.remove(key);
+    }
+    return legacy;
+  }
+
+  static Future<void> write(String key, String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (await _trySecureWrite(key, value)) {
+      await prefs.remove(key); // drop any old plain-text copy
+    } else {
+      // Secure storage unavailable on this device: keep the feature working.
+      try {
+        await _storage.delete(key: key);
+      } catch (_) {}
+      await prefs.setString(key, value);
+    }
+  }
+
+  /// Moves every password an older app version left in plain
+  /// SharedPreferences into secure storage (run once at start-up).
+  static Future<void> migrateLegacy() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final keys = prefs
+          .getKeys()
+          .where((k) => k == 'last_login_password' || k.startsWith('password_local__'))
+          .toList();
+      for (final k in keys) {
+        await read(k); // read() moves it across and removes the plain copy
+      }
+    } catch (err) {
+      if (kDebugMode) debugPrint('Password migration skipped: $err');
+    }
+  }
+
+  static Future<bool> _trySecureWrite(String key, String value) async {
+    try {
+      await _storage.write(key: key, value: value);
+      return true;
+    } catch (err) {
+      if (kDebugMode) debugPrint('Secure write failed for $key: $err');
+      return false;
+    }
+  }
+}
+
+enum RegisterResult {
+  ok,
+  alreadyExists,
+  invalidUsername,
+  weakPassword,
+  tooManyAttempts,
+  failed,
 }
 
 /// =======================================================
@@ -701,6 +917,7 @@ class Auth {
   static const _lastLoginPasswordKey = 'last_login_password';
   static const _customerTypePrefPrefix = 'customer_type_local__';
   static const _passwordPrefPrefix = 'password_local__';
+  static const _lastRegionKey = 'last_region_key';
   static const _syntheticDomain = 'app.local';
 
   static const String _adminEmail = 'mic';
@@ -766,6 +983,9 @@ class Auth {
 
   static bool _isAdminRow(Map<String, dynamic>? row) {
     if (row == null) return false;
+    // Only the admin account itself can be admin. The database also enforces
+    // this (users can no longer set is_admin on their own row).
+    if (row['email'] != _adminEmail) return false;
     final value = row['is_admin'];
     if (value is bool) return value;
     if (value is int) return value != 0;
@@ -868,8 +1088,8 @@ class Auth {
     await prefs.setString(_activeKey, email);
     await prefs.setString(_lastLoginEmailKey, email);
     if (password != null && password.isNotEmpty) {
-      await prefs.setString(_lastLoginPasswordKey, password);
-      await prefs.setString(_passwordPrefKey(email), password);
+      await SecretStore.write(_lastLoginPasswordKey, password);
+      await SecretStore.write(_passwordPrefKey(email), password);
     }
     await prefs.setString(_activeUserIdKey, userId);
     _activeUserId = userId;
@@ -880,7 +1100,37 @@ class Auth {
     _bumpSession();
   }
 
-  static Future<bool> register({
+  static RegisterResult _registerErrorFrom(AuthException err) {
+    final code = (err.code ?? '').toLowerCase();
+    final msg = err.message.toLowerCase();
+    if (code == 'user_already_exists' ||
+        code == 'email_exists' ||
+        msg.contains('already registered') ||
+        msg.contains('already exists')) {
+      return RegisterResult.alreadyExists;
+    }
+    if (code == 'email_address_invalid' ||
+        code == 'validation_failed' ||
+        (msg.contains('invalid') && msg.contains('email'))) {
+      return RegisterResult.invalidUsername;
+    }
+    if (code == 'weak_password' ||
+        (msg.contains('password') &&
+            (msg.contains('weak') ||
+                msg.contains('at least') ||
+                msg.contains('should')))) {
+      return RegisterResult.weakPassword;
+    }
+    if (code.startsWith('over_') ||
+        err.statusCode == '429' ||
+        msg.contains('rate limit') ||
+        msg.contains('too many')) {
+      return RegisterResult.tooManyAttempts;
+    }
+    return RegisterResult.failed;
+  }
+
+  static Future<RegisterResult> register({
     required String email,
     required String password,
     required String regionKey,
@@ -888,14 +1138,13 @@ class Auth {
   }) async {
     final canonical = _canonicalEmail(email);
     final loginEmail = _normalizeLoginEmail(email);
-    if (canonical == _adminEmail) return false;
+    if (canonical == _adminEmail) return RegisterResult.alreadyExists;
     try {
       final response = await _auth.signUp(email: loginEmail, password: password);
       final user = response.user;
-      if (user == null) return false;
+      if (user == null) return RegisterResult.failed;
       final payload = <String, dynamic>{
         'email': canonical,
-        'password': password,
         'user_id': user.id,
         'region_key': regionKey,
         'customer_type': customerType,
@@ -904,21 +1153,19 @@ class Auth {
       final inserted = await _tryInsertUser(payload);
       if (!inserted) {
         await _tryUpdateUser(canonical, {
-          'password': password,
           'user_id': user.id,
           'region_key': regionKey,
           'customer_type': customerType,
         });
       }
       await _cacheCustomerType(canonical, customerType);
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_passwordPrefKey(canonical), password);
+      await SecretStore.write(_passwordPrefKey(canonical), password);
       await _auth.signOut();
-      return true;
-    } on AuthException catch (_) {
-      return false;
+      return RegisterResult.ok;
+    } on AuthException catch (err) {
+      return _registerErrorFrom(err);
     } catch (_) {
-      return false;
+      return RegisterResult.failed;
     }
   }
 
@@ -937,7 +1184,6 @@ class Auth {
       if (row == null) {
         final inserted = await _tryInsertUser({
           'email': canonical,
-          'password': password,
           'user_id': user.id,
           'region_key': null,
           'customer_type': 'residential',
@@ -951,9 +1197,6 @@ class Auth {
         await _tryUpdateUser(canonical, {'user_id': user.id});
         row = await _fetchUser(canonical);
       }
-      await _tryUpdateUser(canonical, {'password': password});
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_passwordPrefKey(canonical), password);
 
       final isAdmin = _isAdminRow(row);
       await _setActiveSession(canonical,
@@ -985,7 +1228,7 @@ class Auth {
   static Future<bool> loginWithPreviousDetails() async {
     final prefs = await SharedPreferences.getInstance();
     final lastEmail = prefs.getString(_lastLoginEmailKey);
-    final lastPassword = prefs.getString(_lastLoginPasswordKey);
+    final lastPassword = await SecretStore.read(_lastLoginPasswordKey);
     if (lastEmail == null ||
         lastEmail.isEmpty ||
         lastPassword == null ||
@@ -1026,10 +1269,12 @@ class Auth {
       final user = signInResponse.user;
       if (user == null) return false;
       await _auth.updateUser(UserAttributes(password: newPassword));
-      await _tryUpdateUser(canonical, {'password': newPassword});
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_lastLoginPasswordKey, newPassword);
-      await prefs.setString(_passwordPrefKey(canonical), newPassword);
+      // Only update the "previous details" password if it belongs to this user.
+      if (prefs.getString(_lastLoginEmailKey) == canonical) {
+        await SecretStore.write(_lastLoginPasswordKey, newPassword);
+      }
+      await SecretStore.write(_passwordPrefKey(canonical), newPassword);
       await _auth.signOut();
       return true;
     } on AuthException catch (_) {
@@ -1089,17 +1334,21 @@ class Auth {
   }
 
   static Future<String?> emailForUserId(String userId) async {
+    return (await emailsByUserId())[userId];
+  }
+
+  /// user_id -> username for every user row visible to the caller.
+  static Future<Map<String, String>> emailsByUserId() async {
     final rows = await _fetchAllUsers();
+    final out = <String, String>{};
     for (final row in rows) {
       final uid = row['user_id'];
-      if (uid is String && uid.isNotEmpty && uid == userId) {
-        final email = row['email'];
-        if (email is String && email.isNotEmpty) {
-          return email;
-        }
+      final email = row['email'];
+      if (uid is String && uid.isNotEmpty && email is String && email.isNotEmpty) {
+        out.putIfAbsent(uid, () => email);
       }
     }
-    return null;
+    return out;
   }
 
   static Future<String?> regionFor(String email) async {
@@ -1114,14 +1363,25 @@ class Auth {
     if (_adminActive && !_adminEditMode && canonical != _adminEmail) return;
     final ok = await _tryUpdateUser(canonical, {'region_key': regionKey});
     if (ok && (_adminImpersonatingEmail == canonical || !isAdminActive)) {
-      await setActiveRegionKey(regionKey);
+      // Don't let an admin editing someone else change this device's
+      // remembered sign-in region.
+      await setActiveRegionKey(regionKey, remember: !isAdminViewing);
     }
   }
 
   // Session-scoped active region (chosen at sign-in)
-  static Future<void> setActiveRegionKey(String regionKey) async {
+  static Future<void> setActiveRegionKey(String regionKey,
+      {bool remember = true}) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_activeRegionSessionKey, regionKey);
+    // Remembered across sessions so the sign-in screen can pre-select it.
+    if (remember) await prefs.setString(_lastRegionKey, regionKey);
+  }
+
+  /// The region last used on this device (survives logout/app restart).
+  static Future<String?> lastUsedRegionKey() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_lastRegionKey);
   }
 
   static Future<String?> activeRegionKey() async {
@@ -1147,18 +1407,11 @@ class Auth {
     await _tryUpdateUser(canonical, {'customer_type': type});
   }
 
+  /// The password saved on THIS device for [email] (saved when the user signs
+  /// in, registers or changes their password here). Passwords are no longer
+  /// stored in the database.
   static Future<String?> storedPassword(String email) async {
-    try {
-      final row = await _fetchUser(email);
-      final password = row?['password'];
-      if (password is String && password.isNotEmpty) {
-        return password;
-      }
-    } catch (_) {
-      // ignore
-    }
-    final prefs = await SharedPreferences.getInstance();
-    final cached = prefs.getString(_passwordPrefKey(email));
+    final cached = await SecretStore.read(_passwordPrefKey(email));
     if (cached != null && cached.isNotEmpty) return cached;
     return null;
   }
@@ -1220,22 +1473,16 @@ class Store {
 
   static String monthKeyOf(DateTime d) => DateFormat('yyyy-MM').format(d);
 
+  /// All transactions, newest first, with expected kWh recalculated.
   static Future<List<TransactionRecord>> loadTransactions() async {
-    final userId = await Auth.activeUserId();
-    if (userId == null) return [];
-    final rows = await _client
-        .from('transactions')
-        .select()
-        .eq('user_id', userId)
-        .order('purchased_at', ascending: true);
-    final raw = rows
-        .map((e) => TransactionRecord.fromSupabase(Map<String, dynamic>.from(e)))
-        .toList();
-    final computed = await _applyExpected(raw);
-    computed.sort((a, b) => b.date.compareTo(a.date));
-    return computed;
+    final computed = await applyExpected(await fetchRawTransactions());
+    // Reverse (not re-sort) so purchases with the same time keep a fixed order.
+    return computed.reversed.toList();
   }
 
+  /// All transactions, oldest first. Purchases with the same date/time are
+  /// ordered by when they were captured, so the order never changes between
+  /// screens.
   static Future<List<TransactionRecord>> fetchRawTransactions() async {
     final userId = await Auth.activeUserId();
     if (userId == null) return [];
@@ -1243,35 +1490,35 @@ class Store {
         .from('transactions')
         .select()
         .eq('user_id', userId)
-        .order('purchased_at', ascending: true);
+        .order('purchased_at', ascending: true)
+        .order('created_at', ascending: true)
+        .order('id', ascending: true);
     return rows
         .map((e) => TransactionRecord.fromSupabase(Map<String, dynamic>.from(e)))
         .toList();
   }
 
-  static Future<List<TransactionRecord>> _applyExpected(
-      List<TransactionRecord> ascending) async {
-    if (ascending.isEmpty) return [];
+  /// The active user's tariff history (for their customer type).
+  static Future<List<RegionTariff>> tariffsForActiveUser() async {
     final email = await Auth.activeEmail();
     final customerType =
         email == null ? 'residential' : await Auth.customerTypeFor(email);
-    final regions = await TariffManager.loadTariffsForType(customerType);
-    final allRegions = await TariffManager.loadTariffsAll();
-    final Map<String, double> monthCursor = {};
-    final List<TransactionRecord> out = [];
-    for (final tx in ascending) {
-      final monthKey = monthKeyOf(tx.date);
-      final key = '${tx.regionKey}__$monthKey';
-      final cursor = monthCursor[key] ?? 0.0;
-      final region = TariffManager.findRegionForDate(allRegions, tx.regionKey, tx.date) ??
-          TariffManager.findRegion(regions, tx.regionKey);
-      final expected = region == null
-          ? tx.actualKwh
-          : Calc.expectedKwhFromMoneyAt(tx.money, region.blocks, cursor);
-      monthCursor[key] = cursor + expected;
-      out.add(tx.copyWith(expectedKwh: expected));
-    }
-    return out;
+    return TariffManager.loadTariffsAll(customerType: customerType);
+  }
+
+  /// Recalculates expected kWh for transactions given oldest first.
+  static Future<List<TransactionRecord>> applyExpected(
+      List<TransactionRecord> ascending) async {
+    if (ascending.isEmpty) return [];
+    return computeExpected(ascending, await tariffsForActiveUser());
+  }
+
+  /// Pure calculation: walks the purchases oldest first and fills in expected
+  /// kWh, continuing the block position from earlier purchases in the same
+  /// month and region (inclining blocks restart every calendar month).
+  static List<TransactionRecord> computeExpected(
+      List<TransactionRecord> ascending, List<RegionTariff> tariffs) {
+    return Calc.runPurchases(ascending, tariffs).map((p) => p.tx).toList();
   }
 
   static Future<void> updateTransactions(List<TransactionRecord> updates) async {
@@ -1312,7 +1559,7 @@ class Store {
     final raw = await fetchRawTransactions();
     final removed = raw.where((t) => monthKeyOf(t.date) == monthKey).toList();
     if (removed.isEmpty) return;
-    await RemoteLog.transactionsDeleted(await _applyExpected(removed));
+    await RemoteLog.transactionsDeleted(await applyExpected(removed));
     final userId = await Auth.activeUserId();
     if (userId == null) return;
     final start = DateTime.parse('$monthKey-01');
@@ -1515,6 +1762,24 @@ class RemoteEvent {
 /// =======================================================
 /// CALC
 /// =======================================================
+/// One purchase after the month-cumulative calculation.
+class PurchaseCalc {
+  final TransactionRecord tx; // with expectedKwh filled in
+  final RegionTariff? tariff; // tariff in force on the purchase date
+  final double kwhBefore; // month-to-date kWh before this purchase
+  final double fixedCharge; // Rand of this purchase taken by the fixed charge
+
+  const PurchaseCalc({
+    required this.tx,
+    required this.tariff,
+    required this.kwhBefore,
+    required this.fixedCharge,
+  });
+
+  /// Rand left for electricity after the fixed charge.
+  double get energyMoney => tx.money - fixedCharge;
+}
+
 class Calc {
   /// Estimate expected kWh by spending through each progressive block.
   /// Assumes rates are VAT-inclusive and blocks are inclusive ranges.
@@ -1631,6 +1896,59 @@ class Calc {
     return out;
   }
 
+  /// How much of a purchase goes to the monthly fixed charge.
+  /// [outstanding] is what is still owed this month (R, VAT incl.).
+  /// City Power rule: the outstanding charge comes off first, but a purchase
+  /// smaller than [splitBelow] is split half to the charge, half to energy.
+  static double fixedChargeTaken(
+      double money, double outstanding, double? splitBelow) {
+    if (outstanding <= 0 || money <= 0) return 0;
+    final share =
+        (splitBelow != null && money < splitBelow) ? money / 2 : money;
+    return share < outstanding ? share : outstanding;
+  }
+
+  /// Walks purchases oldest first and works out, for each one: the tariff in
+  /// force, the month-to-date kWh before it (blocks restart every calendar
+  /// month, per region), the part taken by any monthly fixed charge, and
+  /// the expected kWh for the rest of the money.
+  /// The fixed charge is counted per calendar month; an unpaid balance is not
+  /// carried into the next month.
+  static List<PurchaseCalc> runPurchases(
+      List<TransactionRecord> ascending, List<RegionTariff> tariffs) {
+    final Map<String, double> kwhCursor = {};
+    final Map<String, double> fixedPaid = {};
+    final out = <PurchaseCalc>[];
+    for (final tx in ascending) {
+      final key = '${tx.regionKey}__${Store.monthKeyOf(tx.date)}';
+      final before = kwhCursor[key] ?? 0.0;
+      final tariff =
+          TariffManager.findRegionForDate(tariffs, tx.regionKey, tx.date);
+      if (tariff == null) {
+        out.add(PurchaseCalc(
+            tx: tx.copyWith(expectedKwh: tx.actualKwh),
+            tariff: null,
+            kwhBefore: before,
+            fixedCharge: 0));
+        kwhCursor[key] = before + tx.actualKwh;
+        continue;
+      }
+      final paid = fixedPaid[key] ?? 0.0;
+      final fixed = fixedChargeTaken(
+          tx.money, tariff.fixedMonthly - paid, tariff.fixedSplitBelow);
+      fixedPaid[key] = paid + fixed;
+      final expected =
+          expectedKwhFromMoneyAt(tx.money - fixed, tariff.blocks, before);
+      kwhCursor[key] = before + expected;
+      out.add(PurchaseCalc(
+          tx: tx.copyWith(expectedKwh: expected),
+          tariff: tariff,
+          kwhBefore: before,
+          fixedCharge: fixed));
+    }
+    return out;
+  }
+
   static double vatPortion(double totalIncl) => totalIncl - (totalIncl / 1.15);
   static double netExVat(double totalIncl) => totalIncl / 1.15;
 
@@ -1638,6 +1956,172 @@ class Calc {
     if (expected <= 0) return 0;
     return ((actual - expected) / expected) * 100.0;
   }
+}
+
+/// =======================================================
+/// SMS PARSER (token purchase SMS -> amount, kWh, date)
+/// =======================================================
+class SmsParseResult {
+  final double? amount;
+  final double? kwh;
+  final DateTime? date;
+  const SmsParseResult({this.amount, this.kwh, this.date});
+}
+
+class SmsParser {
+  // A money amount: "1,500.00" / "1,500" (comma thousands) or "500", "500.00", "12,50".
+  static const String _money =
+      r'(\d{1,3}(?:,\d{3}(?!\d))+(?:\.\d{1,2})?|\d+(?:[.,]\d{1,2})?)';
+  // A kWh figure: "1,234.5" (comma thousands) or "152", "152.3", "152,3".
+  static const String _energy =
+      r'(\d{1,3}(?:,\d{3}(?!\d))+(?:\.\d+)?|\d+(?:[.,]\d+)?)';
+  // The amount must end there: not part of a longer number, a date
+  // ("15/10/2025") or a time ("14:30").
+  static const String _end = r'(?![.,/\-:]?\d)';
+
+  static final List<RegExp> _amountPatterns = [
+    // "Total: R500.00", "Amount R 500", "Paid ZAR500"
+    RegExp(
+        r'\b(?:total|amount|amt|paid|tendered)\b(?:\s+paid)?\s*[:=]?\s*(?:zar|r)?\s*' +
+            _money +
+            _end,
+        caseSensitive: false),
+    // "R500.00", "R 1,500", "ZAR500" - a capital R that is not the end of a
+    // word (so "Meter 0412..." is never read as an amount).
+    RegExp(r'(?<![A-Za-z0-9])(?:ZAR|R)[ \t]*' + _money + _end),
+    // "500.00 Rand", "Rand 500"
+    RegExp(r'\brand\s*' + _money + _end, caseSensitive: false),
+    RegExp(r'(?<![\d.,])' + _money + r'\s*rand\b', caseSensitive: false),
+  ];
+
+  // Last resort: a number with exactly two decimals that is not a kWh figure.
+  static final RegExp _genericAmount = RegExp(
+      r'(?<![\d.,])(\d+[.,]\d{2})(?![\d.,])(?!\s*(?:kwh|kw\s?h|units?)\b)',
+      caseSensitive: false);
+
+  static final List<RegExp> _kwhPatterns = [
+    // "152.3kWh", "152,3 kWh", "152 units" - but not a rand amount
+    // ("R1,500.00 Units: 380" - there "Units:" labels the next number).
+    RegExp(
+        r'(?<![\d.,])(?<!(?:^|[^A-Za-z])R\s{0,2})(?<!ZAR\s{0,2})' +
+            _energy +
+            r'\s*(?:kwh|kw\s?h|kwhs|units?)\b(?!\s*[:=])',
+        caseSensitive: false),
+    // "kWh: 152.3", "Units purchased: 152.3"
+    RegExp(
+        r'\b(?:kwh|kw\s?h|units?)(?![a-z])(?:\s+(?:purchased|bought|received|credited))?\s*[:=]?\s*' +
+            _energy,
+        caseSensitive: false),
+  ];
+
+  static double? _number(String raw) {
+    final thousands = RegExp(r'^\d{1,3}(?:,\d{3})+(?:\.\d+)?$');
+    final cleaned =
+        thousands.hasMatch(raw) ? raw.replaceAll(',', '') : raw.replaceAll(',', '.');
+    return double.tryParse(cleaned);
+  }
+
+  static double? parseAmount(String text) {
+    for (final pattern in _amountPatterns) {
+      for (final match in pattern.allMatches(text)) {
+        final value = _number(match.group(1)!);
+        if (value != null && value > 0 && value < 100000) return value;
+      }
+    }
+    for (final match in _genericAmount.allMatches(text)) {
+      final value = _number(match.group(1)!);
+      if (value != null && value > 0 && value < 100000) return value;
+    }
+    return null;
+  }
+
+  static double? parseKwh(String text) {
+    for (final pattern in _kwhPatterns) {
+      for (final match in pattern.allMatches(text)) {
+        final value = _number(match.group(1)!);
+        if (value != null && value > 0 && value < 100000) return value;
+      }
+    }
+    return null;
+  }
+
+  static String _titleCase(String input) {
+    return input
+        .split(RegExp(r'\s+'))
+        .map((word) => word.isEmpty
+            ? word
+            : word[0].toUpperCase() + word.substring(1).toLowerCase())
+        .join(' ');
+  }
+
+  /// Finds a purchase date. Only dates the app's date picker allows are
+  /// returned (not in the future, not more than ~3 years back).
+  static DateTime? parseDate(String text, {DateTime? now}) {
+    final today = now ?? DateTime.now();
+    final earliest = DateTime(today.year - 3);
+    final latest = DateTime(today.year, today.month, today.day, 23, 59, 59);
+    final patterns = [
+      RegExp(r'(\d{4}[-/]\d{2}[-/]\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)'),
+      RegExp(r'(\d{2}[-/]\d{2}[-/]\d{4})'),
+      RegExp(r'(\d{2}\s+[A-Za-z]{3,}\s+\d{4})'),
+      RegExp(r'([A-Za-z]{3,}\s+\d{1,2},?\s+\d{4})'),
+      RegExp(r'(\d{2}[.]+\d{2}[.]+\d{4})'),
+      RegExp(r'(\d{2}[.]+[A-Za-z]{3,}[.]+\d{4})'),
+    ];
+    final formats = [
+      DateFormat('dd/MM/yyyy'),
+      DateFormat('dd-MM-yyyy'),
+      DateFormat('dd MMM yyyy'),
+      DateFormat('dd MMMM yyyy'),
+      DateFormat('MMM dd yyyy'),
+      DateFormat('MMMM dd yyyy'),
+      DateFormat('MMM d yyyy'),
+      DateFormat('MMMM d yyyy'),
+      DateFormat('MM/dd/yyyy'),
+      DateFormat('MM-dd-yyyy'),
+      DateFormat('MM.dd.yyyy'),
+      DateFormat('dd.MM.yyyy'),
+      DateFormat('yyyy/MM/dd'),
+      DateFormat('yyyy-MM-dd'),
+      DateFormat('yyyy.MM.dd'),
+    ];
+    bool inRange(DateTime d) => !d.isBefore(earliest) && !d.isAfter(latest);
+
+    for (final pattern in patterns) {
+      for (final match in pattern.allMatches(text)) {
+        final value = match.group(1)!;
+        final candidates = <String>{
+          value,
+          value.replaceAll('/', '-'),
+          value.replaceAll('.', '-'),
+          value.replaceAll(',', ''),
+          value.toLowerCase(),
+          value.toUpperCase(),
+          _titleCase(value),
+          _titleCase(value.replaceAll(',', '')),
+        };
+        for (final candidate in candidates) {
+          final direct = DateTime.tryParse(candidate);
+          if (direct != null && inRange(direct)) return direct;
+          for (final fmt in formats) {
+            try {
+              // Strict: rejects impossible dates like month 28 instead of
+              // rolling them over into another year.
+              final d = fmt.parseStrict(candidate);
+              if (inRange(d)) return d;
+            } catch (_) {}
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  static SmsParseResult parse(String text, {DateTime? now}) => SmsParseResult(
+        amount: parseAmount(text),
+        kwh: parseKwh(text),
+        date: parseDate(text, now: now),
+      );
 }
 
 /// =======================================================
@@ -1656,6 +2140,7 @@ class _LoginPageState extends State<LoginPage> {
   String message = '';
   List<RegionTariff> _regions = [];
   String? _selectedRegionKey;
+  bool _regionPickedByUser = false;
   String _customerType = 'residential'; // 'residential' | 'commercial'
 
   @override
@@ -1677,7 +2162,11 @@ class _LoginPageState extends State<LoginPage> {
       _selectedRegionKey = null;
     } else if (_selectedRegionKey == null ||
         !_regions.any((r) => r.regionKey == _selectedRegionKey)) {
-      _selectedRegionKey = _regions.first.regionKey;
+      // Pre-select the region last used on this device, if there is one.
+      final last = await Auth.lastUsedRegionKey();
+      _selectedRegionKey = last != null && _regions.any((r) => r.regionKey == last)
+          ? last
+          : _regions.first.regionKey;
     }
     if (mounted) setState(() {});
   }
@@ -1696,8 +2185,16 @@ class _LoginPageState extends State<LoginPage> {
     }
     if (_selectedRegionKey != null) {
       final selected = _selectedRegionKey!;
-      await Auth.setRegion(email, selected);
-      await Auth.setActiveRegionKey(selected);
+      // login() has already loaded the region saved on the account. Only
+      // replace it when the user actually picked a region on this screen, or
+      // the account has no (valid) region yet. Previously every sign-in
+      // silently overwrote it with whatever the list showed.
+      final saved = await Auth.activeRegionKey();
+      final savedValid = saved != null && _regions.any((r) => r.regionKey == saved);
+      if (_regionPickedByUser || !savedValid) {
+        await Auth.setRegion(email, selected);
+        await Auth.setActiveRegionKey(selected);
+      }
     }
     if (mounted) {
       Navigator.of(context).pushReplacement(
@@ -1726,14 +2223,28 @@ class _LoginPageState extends State<LoginPage> {
           _regions.isEmpty ? 'No regions available yet. Try again later.' : 'Select a region.');
       return;
     }
-    final ok = await Auth.register(
+    final result = await Auth.register(
       email: email,
       password: pass,
       regionKey: _selectedRegionKey!,
       customerType: _customerType,
     );
+    final ok = result == RegisterResult.ok;
     setState(() {
-      message = ok ? 'Registered! You can log in.' : 'User already exists.';
+      switch (result) {
+        case RegisterResult.ok:
+          message = 'Registered! You can log in.';
+        case RegisterResult.alreadyExists:
+          message = 'User already exists.';
+        case RegisterResult.invalidUsername:
+          message = 'That username can\'t be used. Use letters and numbers only (no spaces).';
+        case RegisterResult.weakPassword:
+          message = 'That password is too weak. Try a longer one.';
+        case RegisterResult.tooManyAttempts:
+          message = 'Too many attempts. Please wait a few minutes and try again.';
+        case RegisterResult.failed:
+          message = 'Could not register. Check your internet connection and try again.';
+      }
     });
     if (ok) {
       // Seed session region so the next login uses it
@@ -1882,7 +2393,10 @@ class _LoginPageState extends State<LoginPage> {
                                   child: Text(r.displayName),
                                 ))
                             .toList(),
-                        onChanged: (v) => setState(() => _selectedRegionKey = v),
+                        onChanged: (v) => setState(() {
+                          _selectedRegionKey = v;
+                          _regionPickedByUser = true;
+                        }),
                         decoration: const InputDecoration(
                           labelText: 'Select Region (Gauteng)',
                           border: OutlineInputBorder(),
@@ -1935,7 +2449,9 @@ class _LoginPageState extends State<LoginPage> {
                       Text(
                         message,
                         style: TextStyle(
-                          color: message.contains('Registered') || message.contains('changed')
+                          color: message.contains('Registered') ||
+                                  message.contains('changed') ||
+                                  message.startsWith('Password updated')
                               ? Colors.green
                               : Colors.redAccent,
                         ),
@@ -2148,111 +2664,10 @@ class _CalculatorPageState extends State<CalculatorPage> {
       return;
     }
 
-    double? parseAmount(String text) {
-      final moneyPatterns = [
-        RegExp(r'R\s*([0-9]+(?:[.,][0-9]{1,2})?)', caseSensitive: false),
-        RegExp(r'Rand\s*([0-9]+(?:[.,][0-9]{1,2})?)', caseSensitive: false),
-        RegExp(r'Amount[:\s]*([0-9]+(?:[.,][0-9]{1,2})?)', caseSensitive: false),
-      ];
-      for (final pattern in moneyPatterns) {
-        final match = pattern.firstMatch(text);
-        if (match != null) {
-          final raw = match.group(1)!.replaceAll(',', '.');
-          final value = double.tryParse(raw);
-          if (value != null) return value;
-        }
-      }
-      final generic = RegExp(r'([0-9]+(?:[.,][0-9]{1,2}))');
-      final all = generic.allMatches(text).toList();
-      for (final match in all) {
-        final raw = match.group(1)!.replaceAll(',', '.');
-        final value = double.tryParse(raw);
-        if (value != null) return value;
-      }
-      return null;
-    }
-
-    double? parseKwh(String text) {
-      final patterns = [
-        RegExp(r'([0-9]+(?:[.,][0-9]+)?)\s*(?:kwh|kWh|kWhs|units)', caseSensitive: false),
-        RegExp(r'(?:kwh|kWh|units)\s*([0-9]+(?:[.,][0-9]+)?)', caseSensitive: false),
-      ];
-      for (final pattern in patterns) {
-        final match = pattern.firstMatch(text);
-        if (match != null) {
-          final raw = match.group(1)!.replaceAll(',', '.');
-          final value = double.tryParse(raw);
-          if (value != null) return value;
-        }
-      }
-      return null;
-    }
-
-    String titleCase(String input) {
-      return input
-          .split(RegExp(r'\s+'))
-          .map((word) => word.isEmpty
-              ? word
-              : word[0].toUpperCase() + word.substring(1).toLowerCase())
-          .join(' ');
-    }
-
-    DateTime? parseDate(String text) {
-      final patterns = [
-        RegExp(r'(\d{4}[-/]\d{2}[-/]\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)'),
-        RegExp(r'(\d{2}[-/]\d{2}[-/]\d{4})'),
-        RegExp(r'(\d{2}\s+[A-Za-z]{3,}\s+\d{4})'),
-        RegExp(r'([A-Za-z]{3,}\s+\d{1,2},?\s+\d{4})'),
-        RegExp(r'(\d{2}[.]+\d{2}[.]+\d{4})'),
-        RegExp(r'(\d{2}[.]+[A-Za-z]{3,}[.]+\d{4})'),
-      ];
-      DateTime? parsed;
-      for (final pattern in patterns) {
-        final match = pattern.firstMatch(text);
-        if (match == null) continue;
-        final value = match.group(1)!;
-        final candidates = <String>{
-          value,
-          value.replaceAll('/', '-'),
-          value.replaceAll('.', '-'),
-          value.toLowerCase(),
-          value.toUpperCase(),
-          titleCase(value),
-        };
-        final formats = [
-          DateFormat('dd/MM/yyyy'),
-          DateFormat('dd-MM-yyyy'),
-          DateFormat('dd MMM yyyy'),
-          DateFormat('dd MMMM yyyy'),
-          DateFormat('MMM dd yyyy'),
-          DateFormat('MMMM dd yyyy'),
-          DateFormat('MM/dd/yyyy'),
-          DateFormat('MM-dd-yyyy'),
-          DateFormat('MM.dd.yyyy'),
-          DateFormat('dd.MM.yyyy'),
-          DateFormat('yyyy/MM/dd'),
-          DateFormat('yyyy-MM-dd'),
-          DateFormat('yyyy.MM.dd'),
-        ];
-        for (final candidate in candidates) {
-          parsed = DateTime.tryParse(candidate);
-          if (parsed != null) break;
-          for (final fmt in formats) {
-            try {
-              parsed = fmt.parse(candidate);
-              break;
-            } catch (_) {}
-          }
-          if (parsed != null) break;
-        }
-        if (parsed != null) break;
-      }
-      return parsed;
-    }
-
-    final amount = parseAmount(sms);
-    final kwh = parseKwh(sms);
-    final date = parseDate(sms);
+    final parsed = SmsParser.parse(sms);
+    final amount = parsed.amount;
+    final kwh = parsed.kwh;
+    final date = parsed.date;
 
     if (amount != null) {
       moneyC.text = amount.toStringAsFixed(2);
@@ -2313,7 +2728,21 @@ class _CalculatorPageState extends State<CalculatorPage> {
     if (d != null) setState(() => _pickedDate = d);
   }
 
+  bool _saving = false;
+
+  // Ignores a second tap while a save is still running (a quick double tap
+  // used to save the same purchase twice).
   Future<void> _calculateAndSave() async {
+    if (_saving) return;
+    _saving = true;
+    try {
+      await _calculateAndSaveOnce();
+    } finally {
+      _saving = false;
+    }
+  }
+
+  Future<void> _calculateAndSaveOnce() async {
     if (!Auth.canModifyData) {
       _toast('View-only mode. Enable change mode to modify this account.');
       return;
@@ -2338,9 +2767,8 @@ class _CalculatorPageState extends State<CalculatorPage> {
     // to respect IBT blocks across the month.
     final date = _pickedDate ?? DateTime.now();
     // Resolve the tariff version effective on the chosen date
-    final email = await Auth.activeEmail();
-    // Use full history to pick by date
-    final regions = await TariffManager.loadTariffsAll();
+    // (full history for this user's customer type, to pick by date)
+    final regions = await Store.tariffsForActiveUser();
     String? regionKey = _activeRegion?.regionKey ?? await Auth.activeRegionKey();
     if (regionKey != null && regions.every((r) => r.regionKey != regionKey)) {
       regionKey = null;
@@ -2358,12 +2786,10 @@ class _CalculatorPageState extends State<CalculatorPage> {
     }
     final monthKey = Store.monthKeyOf(date);
 
+    // All purchases, oldest first (database order), with the new one placed
+    // after every purchase at the same or an earlier time - no re-sorting, so
+    // the order matches the History and Monthly tabs exactly.
     final rawTransactions = await Store.fetchRawTransactions();
-    final monthList = rawTransactions
-        .where((t) =>
-            Store.monthKeyOf(t.date) == monthKey &&
-            t.regionKey == regionForDate.regionKey)
-        .toList();
     final placeholder = TransactionRecord(
       id: '',
       regionKey: regionForDate.regionKey,
@@ -2372,47 +2798,44 @@ class _CalculatorPageState extends State<CalculatorPage> {
       actualKwh: actual,
       expectedKwh: 0,
     );
-    monthList.add(placeholder);
-    monthList.sort((a, b) => a.date.compareTo(b.date));
+    final insertAt = rawTransactions.indexWhere((t) => t.date.isAfter(date));
+    final withNew = [...rawTransactions]
+      ..insert(insertAt < 0 ? rawTransactions.length : insertAt, placeholder);
 
-    double cursorBought = 0.0;
-    double cursorBeforePurchase = 0.0;
-    final List<TransactionRecord> recomputed = [];
-    TransactionRecord? newTransactionComputed;
-    for (final t in monthList) {
-      if (t.id.isEmpty) {
-        cursorBeforePurchase = cursorBought;
-      }
-      final rT = TariffManager.findRegionForDate(regions, t.regionKey, t.date) ?? regionForDate;
-      final exp = Calc.expectedKwhFromMoneyAt(t.money, rT.blocks, cursorBought);
-      cursorBought += exp;
-      final updated = t.copyWith(expectedKwh: exp);
-      if (t.id.isEmpty) {
-        newTransactionComputed = updated;
-      } else {
-        recomputed.add(updated);
-      }
-    }
+    // One shared calculation (blocks restart monthly, fixed charges included).
+    final results = Calc.runPurchases(withNew, regions);
+    final newResult = results.firstWhere((p) => p.tx.id.isEmpty);
+    // Later purchases in the same month/region shift up the blocks: save them.
+    final recomputed = results
+        .where((p) =>
+            p.tx.id.isNotEmpty &&
+            Store.monthKeyOf(p.tx.date) == monthKey &&
+            p.tx.regionKey == regionForDate.regionKey)
+        .map((p) => p.tx)
+        .toList();
 
     await Store.updateTransactions(recomputed);
-    final inserted = await Store.insertTransaction(newTransactionComputed ?? placeholder);
+    final inserted = await Store.insertTransaction(newResult.tx);
     await RemoteLog.transactionCreated(inserted);
 
+    final usedTariff = newResult.tariff ?? regionForDate;
+    final cursorBeforePurchase = newResult.kwhBefore;
     final expected = inserted.expectedKwh;
-    final breakdown = Calc.breakdownForPurchase(money, regionForDate.blocks, cursorBeforePurchase);
+    final breakdown = Calc.breakdownForPurchase(
+        newResult.energyMoney, usedTariff.blocks, cursorBeforePurchase);
     final pct = Calc.percentDiff(expected, actual);
     final vat = Calc.vatPortion(money);
     final net = Calc.netExVat(money);
     setState(() {
       final bd = breakdown.map((b) {
-        final rng = b.to == null ? '${b.from}-8' : '${b.from}-${b.to}';
-        return 'Tier ${b.tierIndex} (${rng}) @ R${b.rate.toStringAsFixed(4)}/kWh -> '
+        final rng = b.to == null ? '${b.from}-∞' : '${b.from}-${b.to}';
+        return 'Tier ${b.tierIndex} ($rng) @ R${b.rate.toStringAsFixed(4)}/kWh -> '
                '${b.kwh.toStringAsFixed(2)} kWh, R${b.cost.toStringAsFixed(2)}';
       }).join('\n');
 
       _resultText =
           'Detailed calculation (month-cumulative)\n'
-          'Region: ${regionForDate.displayName}\n'
+          'Region: ${usedTariff.displayName}\n'
           'Month-to-date before purchase: ${cursorBeforePurchase.toStringAsFixed(2)} kWh\n'
           'Breakdown:\n${bd.isEmpty ? '(no spend)' : bd}\n'
           '---\n'
@@ -2646,9 +3069,8 @@ class _HistoryPageState extends State<HistoryPage> {
   }
 
   Future<String> _computeDetails(TransactionRecord t) async {
-    // Use customer type of active user if available (falls back to residential)
-    final email = await Auth.activeEmail();
-    final regions = await TariffManager.loadTariffsAll();
+    // Tariffs for the active user's customer type (falls back to residential)
+    final regions = await Store.tariffsForActiveUser();
     if (regions.isEmpty) {
       return 'No tariff data available. Add tariffs in Settings once they are published.';
     }
@@ -2658,30 +3080,32 @@ class _HistoryPageState extends State<HistoryPage> {
       return 'No tariff data found for region ${t.regionKey}.';
     }
 
-    // Compute month-to-date cursor before this transaction for the same region
-    final monthKey = Store.monthKeyOf(t.date);
-    final all = await Store.loadTransactions();
-    final monthList = all
-        .where((x) => Store.monthKeyOf(x.date) == monthKey && x.regionKey == t.regionKey)
-        .toList()
-      ..sort((a, b) => a.date.compareTo(b.date));
-
-    double cursorBought = 0.0;
-    for (final x in monthList) {
-      if (x.id == t.id) break;
-      final expPrev = Calc.expectedKwhFromMoneyAt(x.money, region.blocks, cursorBought);
-      cursorBought += expPrev;
+    // Same order and calculation as the list (and the Calculator), so the
+    // numbers always match: month-to-date kWh before this purchase and any
+    // monthly fixed charge taken from it.
+    final results =
+        Calc.runPurchases(await Store.fetchRawTransactions(), regions);
+    PurchaseCalc? mine;
+    for (final p in results) {
+      if (p.tx.id == t.id) {
+        mine = p;
+        break;
+      }
     }
+    final cursorBought = mine?.kwhBefore ?? 0.0;
+    final fixedCharge = mine?.fixedCharge ?? 0.0;
+    final energyMoney = t.money - fixedCharge;
 
-    final breakdown = Calc.breakdownForPurchase(t.money, region.blocks, cursorBought);
-    final expected = Calc.expectedKwhFromMoneyAt(t.money, region.blocks, cursorBought);
+    final breakdown = Calc.breakdownForPurchase(energyMoney, region.blocks, cursorBought);
+    final expected = mine?.tx.expectedKwh ??
+        Calc.expectedKwhFromMoneyAt(energyMoney, region.blocks, cursorBought);
     final pct = Calc.percentDiff(expected, t.actualKwh);
     final vat = Calc.vatPortion(t.money);
     final net = Calc.netExVat(t.money);
 
     final bd = breakdown.map((b) {
       final rng = b.to == null ? '${b.from}-' : '${b.from}-${b.to}';
-      return 'Tier ${b.tierIndex} (${rng}) @ R${b.rate.toStringAsFixed(4)}/kWh -> '
+      return 'Tier ${b.tierIndex} ($rng) @ R${b.rate.toStringAsFixed(4)}/kWh -> '
           '${b.kwh.toStringAsFixed(2)} kWh, R${b.cost.toStringAsFixed(2)}';
     }).join('\n');
 
@@ -2849,10 +3273,15 @@ class _MonthlyPageState extends State<MonthlyPage> {
 
   Future<void> _reload() async {
     final months = await Store.loadMonthsDesc();
+    // The summary card is labelled "Current month", so show this calendar
+    // month only (not simply the latest month that has purchases).
+    final nowKey = Store.monthKeyOf(DateTime.now());
     MonthlySummary? current;
-    if (months.isNotEmpty) current = await Store.computeSummary(months.first);
+    if (months.contains(nowKey)) current = await Store.computeSummary(nowKey);
     if (mounted) {
       setState(() {
+        // All months stay listed (as before): this list is the only place
+        // where purchases can be deleted.
         _months = months;
         _currentSummary = current;
       });
@@ -3797,7 +4226,7 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _showPreviousFiveYears() async {
     final rk = _currentRegionKey;
     if (rk == null) return;
-    final all = await TariffManager.loadTariffsAll();
+    final all = await TariffManager.loadTariffsAll(customerType: _customerType);
     // Filter this region, sort newest->oldest
     final list = all.where((r) => r.regionKey == rk).toList()
       ..sort((a, b) => b.startDate.compareTo(a.startDate));
