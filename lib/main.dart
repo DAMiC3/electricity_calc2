@@ -896,14 +896,14 @@ class SecretStore {
   }
 }
 
-enum RegisterResult {
-  ok,
-  alreadyExists,
-  invalidUsername,
-  weakPassword,
-  tooManyAttempts,
-  failed,
-}
+/// Result of asking for an emailed sign-in code.
+enum CodeResult { sent, invalidEmail, notAllowed, tooManyAttempts, failed }
+
+/// Result of checking the emailed code.
+enum VerifyResult { ok, wrongCode, failed }
+
+/// Result of "Sign in with previous details".
+enum PreviousResult { ok, none, offline }
 
 /// =======================================================
 /// AUTH (Supabase-backed)
@@ -920,7 +920,9 @@ class Auth {
   static const _lastRegionKey = 'last_region_key';
   static const _syntheticDomain = 'app.local';
 
-  static const String _adminEmail = 'mic';
+  // Admin = signed in with an email on the database's admin list
+  // (public.app_admin_emails), checked at sign-in via is_app_admin().
+  static String? _signedInEmail;
 
   static bool _adminActive = false;
   static bool _adminEditMode = false;
@@ -979,17 +981,6 @@ class Auth {
   static Future<List<Map<String, dynamic>>> _fetchAllUsers() async {
     final List<dynamic> result = await _client.from(_usersTable).select();
     return result.map(_normalizeRow).toList();
-  }
-
-  static bool _isAdminRow(Map<String, dynamic>? row) {
-    if (row == null) return false;
-    // Only the admin account itself can be admin. The database also enforces
-    // this (users can no longer set is_admin on their own row).
-    if (row['email'] != _adminEmail) return false;
-    final value = row['is_admin'];
-    if (value is bool) return value;
-    if (value is int) return value != 0;
-    return false;
   }
 
   static String? _remoteCustomerType(Map<String, dynamic>? row) {
@@ -1093,6 +1084,7 @@ class Auth {
     }
     await prefs.setString(_activeUserIdKey, userId);
     _activeUserId = userId;
+    _signedInEmail = email;
     _adminActive = isAdmin;
     _adminEditMode = false;
     _adminImpersonatingEmail = null;
@@ -1100,147 +1092,198 @@ class Auth {
     _bumpSession();
   }
 
-  static RegisterResult _registerErrorFrom(AuthException err) {
+  static bool _looksLikeEmail(String s) =>
+      RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(s);
+
+  /// app_users stores old-style accounts as the bare username ("bob" for
+  /// bob@app.local) and email accounts as the full address.
+  static String _rowEmailFor(String authEmail) {
+    final e = authEmail.trim().toLowerCase();
+    final suffix = '@$_syntheticDomain';
+    return e.endsWith(suffix) ? e.substring(0, e.length - suffix.length) : e;
+  }
+
+  static CodeResult _codeErrorFrom(AuthException err) {
     final code = (err.code ?? '').toLowerCase();
     final msg = err.message.toLowerCase();
-    if (code == 'user_already_exists' ||
-        code == 'email_exists' ||
-        msg.contains('already registered') ||
-        msg.contains('already exists')) {
-      return RegisterResult.alreadyExists;
+    if (code.startsWith('over_') ||
+        err.statusCode == '429' ||
+        msg.contains('rate limit') ||
+        msg.contains('security purposes') ||
+        msg.contains('too many')) {
+      return CodeResult.tooManyAttempts;
+    }
+    if (code == 'email_address_not_authorized' ||
+        code == 'signup_disabled' ||
+        code == 'otp_disabled' ||
+        msg.contains('not authorized')) {
+      return CodeResult.notAllowed;
     }
     if (code == 'email_address_invalid' ||
         code == 'validation_failed' ||
         (msg.contains('invalid') && msg.contains('email'))) {
-      return RegisterResult.invalidUsername;
+      return CodeResult.invalidEmail;
     }
-    if (code == 'weak_password' ||
-        (msg.contains('password') &&
-            (msg.contains('weak') ||
-                msg.contains('at least') ||
-                msg.contains('should')))) {
-      return RegisterResult.weakPassword;
-    }
-    if (code.startsWith('over_') ||
-        err.statusCode == '429' ||
-        msg.contains('rate limit') ||
-        msg.contains('too many')) {
-      return RegisterResult.tooManyAttempts;
-    }
-    return RegisterResult.failed;
+    return CodeResult.failed;
   }
 
-  static Future<RegisterResult> register({
+  /// Sign-in step 1: email a 6-digit code (creates the account the first
+  /// time an email is used).
+  static Future<CodeResult> sendSignInCode(String rawEmail) async {
+    final email = _canonicalEmail(rawEmail);
+    if (!_looksLikeEmail(email)) return CodeResult.invalidEmail;
+    try {
+      await _auth.signInWithOtp(email: email, shouldCreateUser: true);
+      return CodeResult.sent;
+    } on AuthException catch (err) {
+      if (err is AuthRetryableFetchException) return CodeResult.failed;
+      return _codeErrorFrom(err);
+    } catch (_) {
+      return CodeResult.failed;
+    }
+  }
+
+  /// Sign-in step 2: check the emailed code and sign in. [regionKey] and
+  /// [customerType] are saved only when this creates a new account.
+  static Future<VerifyResult> verifySignInCode({
     required String email,
-    required String password,
-    required String regionKey,
-    required String customerType,
+    required String code,
+    String? regionKey,
+    String? customerType,
   }) async {
     final canonical = _canonicalEmail(email);
-    final loginEmail = _normalizeLoginEmail(email);
-    if (canonical == _adminEmail) return RegisterResult.alreadyExists;
+    final token = code.replaceAll(RegExp(r'\s'), '');
     try {
-      final response = await _auth.signUp(email: loginEmail, password: password);
-      final user = response.user;
-      if (user == null) return RegisterResult.failed;
-      final payload = <String, dynamic>{
+      final res = await _auth.verifyOTP(
+          email: canonical, token: token, type: OtpType.email);
+      final user = res.user ?? _auth.currentUser;
+      if (user == null) return VerifyResult.wrongCode;
+      await _completeSignIn(user, canonical,
+          regionKey: regionKey, customerType: customerType);
+      return VerifyResult.ok;
+    } on AuthException catch (err) {
+      if (err is AuthRetryableFetchException) return VerifyResult.failed;
+      return VerifyResult.wrongCode;
+    } catch (_) {
+      return VerifyResult.failed;
+    }
+  }
+
+  /// Whether the signed-in user is on the database's admin list.
+  static Future<bool> _checkAdmin() async {
+    try {
+      final r = await _client.rpc('is_app_admin');
+      return r == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Everything after Supabase has accepted the sign-in: make sure the
+  /// app_users row exists, work out admin, and load region / customer type.
+  static Future<void> _completeSignIn(
+    User user,
+    String canonical, {
+    String? regionKey,
+    String? customerType,
+    String? password,
+  }) async {
+    Map<String, dynamic>? row = await _fetchUser(canonical);
+    if (row == null) {
+      final inserted = await _tryInsertUser({
         'email': canonical,
         'user_id': user.id,
         'region_key': regionKey,
-        'customer_type': customerType,
+        'customer_type': customerType ?? 'residential',
         'is_admin': false,
-      };
-      final inserted = await _tryInsertUser(payload);
-      if (!inserted) {
-        await _tryUpdateUser(canonical, {
-          'user_id': user.id,
-          'region_key': regionKey,
-          'customer_type': customerType,
-        });
+      });
+      if (inserted) {
+        row = await _fetchUser(canonical);
       }
+    } else if ((row['user_id'] == null) ||
+        (row['user_id'] is String && (row['user_id'] as String).isEmpty)) {
+      await _tryUpdateUser(canonical, {'user_id': user.id});
+      row = await _fetchUser(canonical);
+    }
+
+    final isAdmin = await _checkAdmin();
+    await _setActiveSession(canonical,
+        password: password, isAdmin: isAdmin, userId: user.id);
+
+    final region = row?['region_key'];
+    if (region is String && region.isNotEmpty) {
+      await setActiveRegionKey(region);
+    } else if (!isAdmin) {
+      final savedRegion = await regionFor(canonical);
+      if (savedRegion != null) {
+        await setActiveRegionKey(savedRegion);
+      }
+    }
+
+    final remoteCustomerType = _remoteCustomerType(row);
+    if (remoteCustomerType != null) {
+      await _cacheCustomerType(canonical, remoteCustomerType);
+    } else if (customerType != null) {
       await _cacheCustomerType(canonical, customerType);
-      await SecretStore.write(_passwordPrefKey(canonical), password);
-      await _auth.signOut();
-      return RegisterResult.ok;
-    } on AuthException catch (err) {
-      return _registerErrorFrom(err);
-    } catch (_) {
-      return RegisterResult.failed;
     }
   }
 
-  static Future<bool> login({
-    required String email,
-    required String password,
-  }) async {
+  /// Old-style username + password sign-in. Only used by "Sign in with
+  /// previous details" for accounts from older app versions whose password
+  /// is still saved on this device.
+  static Future<bool> _passwordSignIn(String email, String password) async {
     final canonical = _canonicalEmail(email);
     final loginEmail = _normalizeLoginEmail(email);
     try {
-      final response = await _auth.signInWithPassword(email: loginEmail, password: password);
+      final response =
+          await _auth.signInWithPassword(email: loginEmail, password: password);
       final user = response.user;
       if (user == null) return false;
-
-      Map<String, dynamic>? row = await _fetchUser(canonical);
-      if (row == null) {
-        final inserted = await _tryInsertUser({
-          'email': canonical,
-          'user_id': user.id,
-          'region_key': null,
-          'customer_type': 'residential',
-          'is_admin': false,
-        });
-        if (inserted) {
-          row = await _fetchUser(canonical);
-        }
-      } else if ((row['user_id'] == null) ||
-          (row['user_id'] is String && (row['user_id'] as String).isEmpty)) {
-        await _tryUpdateUser(canonical, {'user_id': user.id});
-        row = await _fetchUser(canonical);
-      }
-
-      final isAdmin = _isAdminRow(row);
-      await _setActiveSession(canonical,
-          password: password, isAdmin: isAdmin, userId: user.id);
-
-      final region = row?['region_key'];
-      if (region is String && region.isNotEmpty) {
-        await setActiveRegionKey(region);
-      } else if (!isAdmin) {
-        final savedRegion = await regionFor(canonical);
-        if (savedRegion != null) {
-          await setActiveRegionKey(savedRegion);
-        }
-      }
-
-      final remoteCustomerType = _remoteCustomerType(row);
-      if (remoteCustomerType != null) {
-        await _cacheCustomerType(canonical, remoteCustomerType);
-      }
-
+      await _completeSignIn(user, canonical, password: password);
       return true;
-    } on AuthException catch (_) {
-      return false;
     } catch (_) {
       return false;
     }
   }
 
-  static Future<bool> loginWithPreviousDetails() async {
+  /// "Sign in with previous details": reuse the sign-in saved on this
+  /// device, so no new code is needed. It stays valid until you log out.
+  static Future<PreviousResult> loginWithPreviousDetails() async {
+    if (_auth.currentSession != null) {
+      try {
+        final res = await _auth.refreshSession();
+        final user = res.user ?? _auth.currentUser;
+        final email = user?.email;
+        if (user != null && email != null && email.isNotEmpty) {
+          await _completeSignIn(user, _rowEmailFor(email));
+          return PreviousResult.ok;
+        }
+      } on AuthRetryableFetchException catch (_) {
+        return PreviousResult.offline;
+      } on AuthException catch (_) {
+        // The saved sign-in is no longer valid: try the older method below.
+      } catch (_) {
+        return PreviousResult.offline;
+      }
+    }
     final prefs = await SharedPreferences.getInstance();
     final lastEmail = prefs.getString(_lastLoginEmailKey);
     final lastPassword = await SecretStore.read(_lastLoginPasswordKey);
-    if (lastEmail == null ||
-        lastEmail.isEmpty ||
-        lastPassword == null ||
-        lastPassword.isEmpty) {
-      return false;
+    if (lastEmail != null &&
+        lastEmail.isNotEmpty &&
+        lastPassword != null &&
+        lastPassword.isNotEmpty) {
+      return await _passwordSignIn(lastEmail, lastPassword)
+          ? PreviousResult.ok
+          : PreviousResult.none;
     }
-    return login(email: lastEmail, password: lastPassword);
+    return PreviousResult.none;
   }
 
   static Future<void> logout() async {
     try {
-      await _auth.signOut();
+      // Only this device; other phones stay signed in.
+      await _auth.signOut(scope: SignOutScope.local);
     } catch (_) {
       // Ignore auth sign-out errors; we'll still clear local state.
     }
@@ -1253,35 +1296,8 @@ class Auth {
     _adminImpersonatingEmail = null;
     _adminImpersonatingUserId = null;
     _activeUserId = null;
+    _signedInEmail = null;
     _bumpSession();
-  }
-
-  static Future<bool> changePassword({
-    required String email,
-    required String currentPassword,
-    required String newPassword,
-  }) async {
-    final canonical = _canonicalEmail(email);
-    final loginEmail = _normalizeLoginEmail(email);
-    try {
-      final signInResponse =
-          await _auth.signInWithPassword(email: loginEmail, password: currentPassword);
-      final user = signInResponse.user;
-      if (user == null) return false;
-      await _auth.updateUser(UserAttributes(password: newPassword));
-      final prefs = await SharedPreferences.getInstance();
-      // Only update the "previous details" password if it belongs to this user.
-      if (prefs.getString(_lastLoginEmailKey) == canonical) {
-        await SecretStore.write(_lastLoginPasswordKey, newPassword);
-      }
-      await SecretStore.write(_passwordPrefKey(canonical), newPassword);
-      await _auth.signOut();
-      return true;
-    } on AuthException catch (_) {
-      return false;
-    } catch (_) {
-      return false;
-    }
   }
 
   static Future<String?> activeEmail() async {
@@ -1291,7 +1307,7 @@ class Auth {
     final prefs = await SharedPreferences.getInstance();
     final stored = prefs.getString(_activeKey);
     if (_adminActive) {
-      return stored ?? _adminEmail;
+      return stored ?? _signedInEmail;
     }
     return stored;
   }
@@ -1360,7 +1376,7 @@ class Auth {
 
   static Future<void> setRegion(String email, String regionKey) async {
     final canonical = _canonicalEmail(email);
-    if (_adminActive && !_adminEditMode && canonical != _adminEmail) return;
+    if (_adminActive && !_adminEditMode && canonical != _signedInEmail) return;
     final ok = await _tryUpdateUser(canonical, {'region_key': regionKey});
     if (ok && (_adminImpersonatingEmail == canonical || !isAdminActive)) {
       // Don't let an admin editing someone else change this device's
@@ -1402,7 +1418,7 @@ class Auth {
 
   static Future<void> setCustomerType(String email, String type) async {
     final canonical = _canonicalEmail(email);
-    if (_adminActive && !_adminEditMode && canonical != _adminEmail) return;
+    if (_adminActive && !_adminEditMode && canonical != _signedInEmail) return;
     await _cacheCustomerType(canonical, type);
     await _tryUpdateUser(canonical, {'customer_type': type});
   }
@@ -2136,8 +2152,8 @@ class LoginPage extends StatefulWidget {
 
 class _LoginPageState extends State<LoginPage> {
   final emailC = TextEditingController();
-  final passC = TextEditingController();
   String message = '';
+  bool _busy = false; // a code request / sign-in is running
   List<RegionTariff> _regions = [];
   String? _selectedRegionKey;
   bool _regionPickedByUser = false;
@@ -2152,7 +2168,6 @@ class _LoginPageState extends State<LoginPage> {
   @override
   void dispose() {
     emailC.dispose();
-    passC.dispose();
     super.dispose();
   }
 
@@ -2171,51 +2186,179 @@ class _LoginPageState extends State<LoginPage> {
     if (mounted) setState(() {});
   }
 
+  static String _codeMessage(CodeResult r) {
+    switch (r) {
+      case CodeResult.sent:
+        return 'A new code has been sent.';
+      case CodeResult.invalidEmail:
+        return 'Enter a valid email address.';
+      case CodeResult.notAllowed:
+        return 'This email can\'t receive sign-in codes yet.';
+      case CodeResult.tooManyAttempts:
+        return 'Too many codes requested. Please wait a while and try again.';
+      case CodeResult.failed:
+        return 'Could not send the code. Check your internet connection and try again.';
+    }
+  }
+
+  /// Emails a code and asks for it. Returns true once signed in.
+  Future<bool> _signInWithCode(String email,
+      {String? regionKey, String? customerType}) async {
+    final sent = await Auth.sendSignInCode(email);
+    if (sent != CodeResult.sent) {
+      if (mounted) setState(() => message = _codeMessage(sent));
+      return false;
+    }
+    if (!mounted) return false;
+
+    // Not disposed: the dialog's closing animation may still use it.
+    final codeC = TextEditingController();
+    String? error;
+    String? info;
+    bool checking = false;
+    final ok = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialog) {
+          Future<void> submit() async {
+            final code = codeC.text.replaceAll(RegExp(r'\s'), '');
+            if (code.length < 6) {
+              setDialog(() => error = 'Enter the 6-digit code from the email.');
+              return;
+            }
+            setDialog(() {
+              checking = true;
+              error = null;
+              info = null;
+            });
+            final r = await Auth.verifySignInCode(
+                email: email,
+                code: code,
+                regionKey: regionKey,
+                customerType: customerType);
+            if (!ctx.mounted) return;
+            if (r == VerifyResult.ok) {
+              Navigator.of(ctx).pop(true);
+              return;
+            }
+            setDialog(() {
+              checking = false;
+              error = r == VerifyResult.wrongCode
+                  ? 'That code is wrong or has expired.'
+                  : 'Could not check the code. Check your internet connection.';
+            });
+          }
+
+          Future<void> resend() async {
+            setDialog(() {
+              checking = true;
+              error = null;
+              info = null;
+            });
+            final r = await Auth.sendSignInCode(email);
+            if (!ctx.mounted) return;
+            setDialog(() {
+              checking = false;
+              if (r == CodeResult.sent) {
+                info = _codeMessage(r);
+              } else {
+                error = _codeMessage(r);
+              }
+            });
+          }
+
+          return AlertDialog(
+            title: const Text('Enter sign-in code'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('We emailed a 6-digit code to $email.'),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: codeC,
+                  autofocus: true,
+                  keyboardType: TextInputType.number,
+                  maxLength: 6,
+                  enabled: !checking,
+                  onSubmitted: (_) => submit(),
+                  decoration: InputDecoration(
+                    labelText: 'Code',
+                    border: const OutlineInputBorder(),
+                    counterText: '',
+                    errorText: error,
+                    helperText: info,
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: checking ? null : resend,
+                child: const Text('Send new code'),
+              ),
+              TextButton(
+                onPressed: checking ? null : () => Navigator.of(ctx).pop(false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: checking ? null : submit,
+                child: const Text('Sign in'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    return ok == true;
+  }
+
+  Future<void> _goHome() async {
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => const HomeShell()),
+    );
+  }
+
   Future<void> _doLogin() async {
+    if (_busy) return;
     final email = emailC.text.trim();
-    final pass = passC.text;
-    if (email.isEmpty || pass.isEmpty) {
-      setState(() => message = 'Please enter username and password.');
+    if (email.isEmpty) {
+      setState(() => message = 'Please enter your email.');
       return;
     }
-    final ok = await Auth.login(email: email, password: pass);
-    if (!ok) {
-      setState(() => message = 'Invalid login.');
-      return;
-    }
-    if (_selectedRegionKey != null) {
-      final selected = _selectedRegionKey!;
-      // login() has already loaded the region saved on the account. Only
-      // replace it when the user actually picked a region on this screen, or
-      // the account has no (valid) region yet. Previously every sign-in
-      // silently overwrote it with whatever the list showed.
-      final saved = await Auth.activeRegionKey();
-      final savedValid = saved != null && _regions.any((r) => r.regionKey == saved);
-      if (_regionPickedByUser || !savedValid) {
-        await Auth.setRegion(email, selected);
-        await Auth.setActiveRegionKey(selected);
+    setState(() {
+      _busy = true;
+      message = '';
+    });
+    try {
+      final ok = await _signInWithCode(email,
+          regionKey: _selectedRegionKey, customerType: _customerType);
+      if (!ok) return;
+      if (_selectedRegionKey != null) {
+        final selected = _selectedRegionKey!;
+        // Sign-in has already loaded the region saved on the account. Only
+        // replace it when the user actually picked a region on this screen,
+        // or the account has no (valid) region yet.
+        final saved = await Auth.activeRegionKey();
+        final savedValid = saved != null && _regions.any((r) => r.regionKey == saved);
+        if (_regionPickedByUser || !savedValid) {
+          await Auth.setRegion(Auth.canonicalEmail(email), selected);
+          await Auth.setActiveRegionKey(selected);
+        }
       }
-    }
-    if (mounted) {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const HomeShell()),
-      );
+      await _goHome();
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
   }
 
   Future<void> _doRegister() async {
+    if (_busy) return;
     final email = emailC.text.trim();
-    final pass = passC.text;
-    if (email.isEmpty || pass.isEmpty) {
-      setState(() => message = 'Please enter username and password.');
-      return;
-    }
-    if (email.length < 3) {
-      setState(() => message = 'Username must be at least 3 characters long.');
-      return;
-    }
-    if (pass.length < 6) {
-      setState(() => message = 'Password must be at least 6 characters long.');
+    if (email.isEmpty) {
+      setState(() => message = 'Please enter your email.');
       return;
     }
     if (_selectedRegionKey == null) {
@@ -2223,110 +2366,51 @@ class _LoginPageState extends State<LoginPage> {
           _regions.isEmpty ? 'No regions available yet. Try again later.' : 'Select a region.');
       return;
     }
-    final result = await Auth.register(
-      email: email,
-      password: pass,
-      regionKey: _selectedRegionKey!,
-      customerType: _customerType,
-    );
-    final ok = result == RegisterResult.ok;
     setState(() {
-      switch (result) {
-        case RegisterResult.ok:
-          message = 'Registered! You can log in.';
-        case RegisterResult.alreadyExists:
-          message = 'User already exists.';
-        case RegisterResult.invalidUsername:
-          message = 'That username can\'t be used. Use letters and numbers only (no spaces).';
-        case RegisterResult.weakPassword:
-          message = 'That password is too weak. Try a longer one.';
-        case RegisterResult.tooManyAttempts:
-          message = 'Too many attempts. Please wait a few minutes and try again.';
-        case RegisterResult.failed:
-          message = 'Could not register. Check your internet connection and try again.';
-      }
+      _busy = true;
+      message = '';
     });
-    if (ok) {
-      // Seed session region so the next login uses it
-      await Auth.setActiveRegionKey(_selectedRegionKey!);
+    try {
+      // New accounts get the region and customer type chosen here; an
+      // existing account simply signs in and keeps its own.
+      final ok = await _signInWithCode(email,
+          regionKey: _selectedRegionKey, customerType: _customerType);
+      if (!ok) return;
+      final saved = await Auth.activeRegionKey();
+      if (saved == null) await Auth.setActiveRegionKey(_selectedRegionKey!);
+      await _goHome();
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
-  }
-
-  Future<void> _doChangePass() async {
-    final email = emailC.text.trim();
-    final currentPass = passC.text;
-    if (email.isEmpty || currentPass.isEmpty) {
-      setState(() => message = 'Enter your username and current password.');
-      return;
-    }
-    final newPassController = TextEditingController();
-    final newPassword = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Set new password'),
-        content: TextField(
-          controller: newPassController,
-          obscureText: true,
-          decoration: const InputDecoration(
-            labelText: 'New password',
-            border: OutlineInputBorder(),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () {
-              final value = newPassController.text.trim();
-              Navigator.of(ctx).pop(value.isEmpty ? null : value);
-            },
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-    newPassController.dispose();
-    if (newPassword == null || newPassword.isEmpty) {
-      setState(() => message = 'Password change cancelled.');
-      return;
-    }
-    final ok = await Auth.changePassword(
-      email: email,
-      currentPassword: currentPass,
-      newPassword: newPassword,
-    );
-    if (ok) {
-      passC.clear();
-    }
-    setState(() {
-      message = ok
-          ? 'Password updated. Use your new password to sign in.'
-          : 'Incorrect username or password. Try again.';
-    });
   }
 
   Future<void> _signInWithPrevious() async {
-    setState(() => message = '');
-    final ok = await Auth.loginWithPreviousDetails();
-    if (!ok) {
-      if (mounted) {
-        setState(() => message = 'No previous sign-in saved on this device.');
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      message = '';
+    });
+    try {
+      final result = await Auth.loginWithPreviousDetails();
+      if (result != PreviousResult.ok) {
+        if (mounted) {
+          setState(() => message = result == PreviousResult.offline
+              ? 'You seem to be offline. Connect to the internet and try again.'
+              : 'No previous sign-in saved on this device. Enter your email to get a code.');
+        }
+        return;
       }
-      return;
-    }
-    final email = await Auth.activeEmail();
-    if (email != null) {
-      final region = await Auth.regionFor(email);
-      if (region != null) {
-        await Auth.setActiveRegionKey(region);
+      final email = await Auth.activeEmail();
+      if (email != null) {
+        final region = await Auth.regionFor(email);
+        if (region != null) {
+          await Auth.setActiveRegionKey(region);
+        }
       }
+      await _goHome();
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
-    if (!mounted) return;
-    Navigator.of(context).pushReplacement(
-      MaterialPageRoute(builder: (_) => const HomeShell()),
-    );
   }
 
   @override
@@ -2364,17 +2448,10 @@ class _LoginPageState extends State<LoginPage> {
                     const SizedBox(height: 12),
                     TextField(
                       controller: emailC,
+                      keyboardType: TextInputType.emailAddress,
+                      autocorrect: false,
                       decoration: const InputDecoration(
-                        labelText: 'Username',
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: passC,
-                      obscureText: true,
-                      decoration: const InputDecoration(
-                        labelText: 'Password',
+                        labelText: 'Email',
                         border: OutlineInputBorder(),
                       ),
                     ),
@@ -2435,23 +2512,16 @@ class _LoginPageState extends State<LoginPage> {
                             child: const Text('Register'),
                           ),
                         ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: OutlinedButton(
-                            onPressed: _doChangePass,
-                            child: const Text('Change Password'),
-                          ),
-                        ),
                       ],
                     ),
                     const SizedBox(height: 8),
                     if (message.isNotEmpty)
                       Text(
                         message,
+                        textAlign: TextAlign.center,
                         style: TextStyle(
                           color: message.contains('Registered') ||
-                                  message.contains('changed') ||
-                                  message.startsWith('Password updated')
+                                  message.contains('has been sent')
                               ? Colors.green
                               : Colors.redAccent,
                         ),
@@ -4083,15 +4153,12 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _showCredentials() async {
     final email = _email;
     if (email == null) return;
+    // Email-code accounts have no password; older accounts may still have
+    // one saved on this device.
     final password = await Auth.storedPassword(email);
     if (!mounted) return;
-    if (password == null || password.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No saved password found for this account.')),
-      );
-      return;
-    }
-    final controller = TextEditingController(text: password);
+    final hasPassword = password != null && password.isNotEmpty;
+    final controller = TextEditingController(text: password ?? '');
     await showDialog<void>(
       context: context,
       builder: (_) {
@@ -4103,21 +4170,25 @@ class _SettingsPageState extends State<SettingsPage> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                SelectableText('Username: $email'),
+                SelectableText(
+                    '${email.contains('@') ? 'Email' : 'Username'}: $email'),
                 const SizedBox(height: 8),
-                TextField(
-                  controller: controller,
-                  readOnly: true,
-                  obscureText: obscure,
-                  enableInteractiveSelection: true,
-                  decoration: InputDecoration(
-                    labelText: 'Password',
-                    suffixIcon: IconButton(
-                      icon: Icon(obscure ? Icons.visibility_off : Icons.visibility),
-                      onPressed: () => setStateDialog(() => obscure = !obscure),
+                if (hasPassword)
+                  TextField(
+                    controller: controller,
+                    readOnly: true,
+                    obscureText: obscure,
+                    enableInteractiveSelection: true,
+                    decoration: InputDecoration(
+                      labelText: 'Password',
+                      suffixIcon: IconButton(
+                        icon: Icon(obscure ? Icons.visibility_off : Icons.visibility),
+                        onPressed: () => setStateDialog(() => obscure = !obscure),
+                      ),
                     ),
-                  ),
-                ),
+                  )
+                else
+                  const Text('You sign in with a code sent to this email - there is no password.'),
               ],
             ),
             actions: [
