@@ -1,0 +1,14 @@
+// Publishes the web version of Prepaid Watchdog (iPhone "Add to Home Screen").
+// Build first:  flutter build web --release
+// Then deploy:  npx wrangler deploy        (from this folder)
+// Live at:      https://prepaid-watchdog.bernardmanne3.workers.dev
+{
+  "name": "prepaid-watchdog",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "./build/web",
+    "not_found_handling": "single-page-application"
+  },
+  // Static site only: no scheduled jobs.
+  "triggers": { "crons": [] }
+}
