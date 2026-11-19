@@ -2,6 +2,7 @@
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -2201,7 +2202,8 @@ class _LoginPageState extends State<LoginPage> {
     }
   }
 
-  /// Emails a code and asks for it. Returns true once signed in.
+  /// Emails a code, then opens the screen where it is typed in. Returns
+  /// true once signed in.
   Future<bool> _signInWithCode(String email,
       {String? regionKey, String? customerType}) async {
     final sent = await Auth.sendSignInCode(email);
@@ -2210,105 +2212,13 @@ class _LoginPageState extends State<LoginPage> {
       return false;
     }
     if (!mounted) return false;
-
-    // Not disposed: the dialog's closing animation may still use it.
-    final codeC = TextEditingController();
-    String? error;
-    String? info;
-    bool checking = false;
-    final ok = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDialog) {
-          Future<void> submit() async {
-            final code = codeC.text.replaceAll(RegExp(r'\s'), '');
-            if (code.length < 6) {
-              setDialog(() => error = 'Enter the 6-digit code from the email.');
-              return;
-            }
-            setDialog(() {
-              checking = true;
-              error = null;
-              info = null;
-            });
-            final r = await Auth.verifySignInCode(
-                email: email,
-                code: code,
-                regionKey: regionKey,
-                customerType: customerType);
-            if (!ctx.mounted) return;
-            if (r == VerifyResult.ok) {
-              Navigator.of(ctx).pop(true);
-              return;
-            }
-            setDialog(() {
-              checking = false;
-              error = r == VerifyResult.wrongCode
-                  ? 'That code is wrong or has expired.'
-                  : 'Could not check the code. Check your internet connection.';
-            });
-          }
-
-          Future<void> resend() async {
-            setDialog(() {
-              checking = true;
-              error = null;
-              info = null;
-            });
-            final r = await Auth.sendSignInCode(email);
-            if (!ctx.mounted) return;
-            setDialog(() {
-              checking = false;
-              if (r == CodeResult.sent) {
-                info = _codeMessage(r);
-              } else {
-                error = _codeMessage(r);
-              }
-            });
-          }
-
-          return AlertDialog(
-            title: const Text('Enter sign-in code'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('We emailed a 6-digit code to $email.'),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: codeC,
-                  autofocus: true,
-                  keyboardType: TextInputType.number,
-                  maxLength: 6,
-                  enabled: !checking,
-                  onSubmitted: (_) => submit(),
-                  decoration: InputDecoration(
-                    labelText: 'Code',
-                    border: const OutlineInputBorder(),
-                    counterText: '',
-                    errorText: error,
-                    helperText: info,
-                  ),
-                ),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: checking ? null : resend,
-                child: const Text('Send new code'),
-              ),
-              TextButton(
-                onPressed: checking ? null : () => Navigator.of(ctx).pop(false),
-                child: const Text('Cancel'),
-              ),
-              FilledButton(
-                onPressed: checking ? null : submit,
-                child: const Text('Sign in'),
-              ),
-            ],
-          );
-        },
+    final ok = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => SignInCodePage(
+          email: email,
+          regionKey: regionKey,
+          customerType: customerType,
+        ),
       ),
     );
     return ok == true;
@@ -2527,6 +2437,229 @@ class _LoginPageState extends State<LoginPage> {
                         ),
                       ),
                   ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// =======================================================
+/// SIGN-IN CODE SCREEN
+/// =======================================================
+/// Second sign-in step: type the 6-digit code from the email. Closes with
+/// true once signed in.
+class SignInCodePage extends StatefulWidget {
+  const SignInCodePage({
+    super.key,
+    required this.email,
+    this.regionKey,
+    this.customerType,
+  });
+
+  final String email;
+  final String? regionKey;
+  final String? customerType;
+
+  @override
+  State<SignInCodePage> createState() => _SignInCodePageState();
+}
+
+class _SignInCodePageState extends State<SignInCodePage> {
+  /// Supabase sends at most one code per email per minute.
+  static const _resendWaitSeconds = 60;
+
+  final codeC = TextEditingController();
+  String message = '';
+  bool _messageIsInfo = false;
+  bool _busy = false;
+  int _resendWait = _resendWaitSeconds;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _startResendTimer();
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    codeC.dispose();
+    super.dispose();
+  }
+
+  void _startResendTimer() {
+    _timer?.cancel();
+    _resendWait = _resendWaitSeconds;
+    _timer = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted) {
+        t.cancel();
+        return;
+      }
+      setState(() {
+        _resendWait--;
+        if (_resendWait <= 0) {
+          _resendWait = 0;
+          t.cancel();
+        }
+      });
+    });
+  }
+
+  void _show(String text, {bool info = false}) {
+    if (!mounted) return;
+    setState(() {
+      message = text;
+      _messageIsInfo = info;
+    });
+  }
+
+  Future<void> _submit() async {
+    if (_busy) return;
+    final code = codeC.text.replaceAll(RegExp(r'\s'), '');
+    if (!RegExp(r'^\d{6}$').hasMatch(code)) {
+      _show('Enter the 6-digit code from the email.');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      message = '';
+    });
+    final r = await Auth.verifySignInCode(
+      email: widget.email,
+      code: code,
+      regionKey: widget.regionKey,
+      customerType: widget.customerType,
+    );
+    if (!mounted) return;
+    if (r == VerifyResult.ok) {
+      Navigator.of(context).pop(true);
+      return;
+    }
+    setState(() => _busy = false);
+    _show(r == VerifyResult.wrongCode
+        ? 'That code is wrong or has expired.'
+        : 'Could not check the code. Check your internet connection.');
+  }
+
+  Future<void> _resend() async {
+    if (_busy || _resendWait > 0) return;
+    setState(() {
+      _busy = true;
+      message = '';
+    });
+    final r = await Auth.sendSignInCode(widget.email);
+    if (!mounted) return;
+    setState(() => _busy = false);
+    if (r == CodeResult.sent) {
+      codeC.clear();
+      _startResendTimer();
+      _show(_LoginPageState._codeMessage(r), info: true);
+    } else {
+      _show(_LoginPageState._codeMessage(r));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final email = widget.email.trim();
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            colors: [Color(0xFFFFF3E0), Color(0xFFFFD180)],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+        ),
+        padding: const EdgeInsets.all(20),
+        child: Center(
+          child: SingleChildScrollView(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 420),
+              child: Card(
+                elevation: 12,
+                color: Colors.white,
+                shadowColor: Colors.deepOrange.withOpacity(0.25),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text('Check your email',
+                          style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
+                      const SizedBox(height: 8),
+                      Text(
+                        'We sent a 6-digit code to $email. Also check your spam folder.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.grey.shade700),
+                      ),
+                      const SizedBox(height: 16),
+                      TextField(
+                        controller: codeC,
+                        autofocus: true,
+                        enabled: !_busy,
+                        keyboardType: TextInputType.number,
+                        autofillHints: const [AutofillHints.oneTimeCode],
+                        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                        maxLength: 6,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.w600, letterSpacing: 8),
+                        onChanged: (v) {
+                          if (v.length == 6) _submit();
+                        },
+                        onSubmitted: (_) => _submit(),
+                        decoration: const InputDecoration(
+                          labelText: 'Code',
+                          border: OutlineInputBorder(),
+                          counterText: '',
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: FilledButton(
+                              onPressed: _busy ? null : _submit,
+                              child: Text(_busy ? 'Please wait...' : 'Sign in'),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        alignment: WrapAlignment.spaceBetween,
+                        children: [
+                          TextButton.icon(
+                            onPressed: _busy ? null : () => Navigator.of(context).pop(false),
+                            icon: const Icon(Icons.arrow_back, size: 16),
+                            label: const Text('Change email'),
+                          ),
+                          TextButton(
+                            onPressed: _busy || _resendWait > 0 ? null : _resend,
+                            child: Text(_resendWait > 0
+                                ? 'Send new code (${_resendWait}s)'
+                                : 'Send new code'),
+                          ),
+                        ],
+                      ),
+                      if (message.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          message,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                              color: _messageIsInfo ? Colors.green : Colors.redAccent),
+                        ),
+                      ],
+                    ],
+                  ),
                 ),
               ),
             ),
